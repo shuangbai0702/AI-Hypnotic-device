@@ -101,6 +101,13 @@ async function prompt(text) {
     return events.events.findLast(e => e.type.startsWith('turn/'))?.type === 'turn/end';
   }, 'durable completed turn');
 }
+function validateStoredSession() {
+  const directory = fs.readdirSync(join(home, 'sessions')).map(name => join(home, 'sessions', name, id)).find(path => fs.existsSync(join(path, 'session.v4.jsonl.zstd')));
+  assert.ok(directory);
+  const rows = loadSession(directory).events, header = rows[0], events = rows.slice(1);
+  Session.create(id, events, header);
+  assertReleasedV4Relationships({ header, events, inheritedEventCount: 0 }, new Set(events.map(event => event.type)));
+}
 try {
   // Assert that no server already owns the target port before modifying files.
   const probe = createServer(); await new Promise((done, reject) => { probe.once('error', reject); probe.listen(port, '127.0.0.1', done); });
@@ -142,17 +149,34 @@ try {
     const history = await api('/events?id=' + id);
     const page = await rpc('page', { address: { kind: 'session', sessionId: id }, throughSeq: history.total - 1, maxMessages: 100 });
     assert.ok(page && typeof page === 'object');
+    // A valid log immediately after removal is insufficient: the resident
+    // loop may still hold the pre-edit turn counter until its next request.
+    await prompt('Continue after removal ' + index);
+    const retained = JSON.stringify(captures.at(-1).messages);
+    assert.ok(!retained.includes(target.text), 'removed assistant must stay out of the next request');
+    validateStoredSession();
   }
+  for (const role of ['user', 'system', 'developer', 'assistant']) {
+    view = await context();
+    const text = 'QA_INSERTED_' + role.toUpperCase();
+    await api('/insert', { role, blocks: [{ type: 'text', text }], expectRevision: view.contentRevision });
+    assert.ok(JSON.stringify((await context()).messages).includes(text), 'insert is visible before next turn: ' + role);
+    await prompt('Continue after inserting ' + role);
+    // Native DSH rebuilds system prompts and filters developer messages on
+    // this adapter route (dsh-llm capability projection). Preserve both native
+    // contracts; user/assistant insertions remain in the actual request.
+    assert.equal(JSON.stringify(captures.at(-1).messages).includes(text), ['user', 'assistant'].includes(role), 'next request follows native role semantics: ' + role);
+    validateStoredSession();
+  }
+  await stop(); await start(); await prompt('Continue after edit and service restart');
   const concurrent = await Promise.all(Array.from({ length: 8 }, () => context()));
   assert.ok(concurrent.every(value => value.contentRevision === concurrent[0].contentRevision));
   assert.ok(concurrent.every(value => JSON.stringify(value.messages) === JSON.stringify(concurrent[0].messages)));
-  const directory = fs.readdirSync(join(home, 'sessions')).map(name => join(home, 'sessions', name, id)).find(path => fs.existsSync(join(path, 'session.v4.jsonl.zstd')));
-  assert.ok(directory); const rows = loadSession(directory).events, header = rows[0], events = rows.slice(1);
-  Session.create(id, events, header);
-  assertReleasedV4Relationships({ header, events, inheritedEventCount: 0 }, new Set(events.map(event => event.type)));
+  validateStoredSession();
   console.log(JSON.stringify({ ok: true, nativeWebSession: true, modelRequests: captures.length,
     summaryEdited: true, retainedAssistantEdited: true, archivedOriginalReadOnly: true,
-    secondCompactionAndRestart: true, repeatedRemovalAndNativeHistory: true, concurrentReads: 8, nativeValidation: true }));
+    secondCompactionAndRestart: true, repeatedRemovalAndNativeHistory: true, continueAfterEachRemoval: true,
+    insertRolesAndContinue: true, continueAfterServiceRestart: true, concurrentReads: 8, nativeValidation: true }));
 } finally {
   await stop(); fs.writeFileSync(config, original);
   mock.closeAllConnections(); await new Promise(done => mock.close(done));

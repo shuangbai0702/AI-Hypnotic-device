@@ -205,15 +205,79 @@ test("install, reinstall, uninstall preserve host bytes; unknown builds are reje
 });
 
 test('remove gate rejects running, stale and inactive nodes before any append', async () => {
-  const routes = new Map(), events = [message(0, 'keep')];
-  let running = false, active = true, appends = 0;
-  const session = { snapshotEvents: () => events, get surface() { return { nodes: active ? [0] : [], contentGeneration: 0 }; }, append() { appends++; throw new Error('unexpected write'); } };
-  registerEditRoutes({ sessions: { get: () => session }, agents: { get: () => ({ status: running ? 'running' : 'idle' }) } }, (path, _methods, handler) => routes.set(path, handler), null);
-  const call = expectRevision => routes.get('/api/session-editor/delete-node')(new Request('http://local/delete', { method: 'POST', body: JSON.stringify({ id: 'test', seq: 0, expectRevision }) }));
+  const routes = new Map(); let appends = 0;
+  const fixture = idleWriterFixture(Session.create('test', [message(0, 'keep')]), () => appends++);
+  const events = fixture.session.snapshotEvents();
+  registerEditRoutes(fixture.ctx, (path, _methods, handler) => routes.set(path, handler), null);
+  const call = (expectRevision, seq = 0) => routes.get('/api/session-editor/delete-node')(new Request('http://local/delete', { method: 'POST', body: JSON.stringify({ id: 'test', seq, expectRevision }) }));
   assert.equal((await call('stale')).status, 409);
-  running = true; assert.equal((await call(contentRevision(events))).status, 409);
-  running = false; active = false; assert.equal((await call(contentRevision(events))).status, 409);
+  // Restore a live owner before checking its running gate.
+  await fixture.ctx.agents.resume(); fixture.running(true);
+  assert.equal((await call(contentRevision(events))).status, 409);
+  fixture.running(false); assert.equal((await call(contentRevision(events), 999)).status, 409);
   assert.equal(appends, 0);
+  assert.deepEqual(fixture.session.snapshotEvents(), events);
+});
+
+// Model the lifecycle/store and exclusive persistence boundary, rather than
+// returning the same resident Session forever after a release.
+function idleWriterFixture(initial, onFlush = () => {}) {
+  const header = initial.header;
+  let live = initial, rows = initial.snapshotEvents(), running = false, leased = false;
+  const restored = () => Session.fromRestore(header.id, structuredClone(rows), header, 0, 'detached');
+  const ctx = {
+    get: () => ctx.agents,
+    sessions: {
+      get: () => live,
+      prepare(id, options) {
+        assert.equal(live, undefined); assert.equal(leased, true);
+        return Session.fromRestore(id, options.seed, options.meta, options.inheritedEventCount, options.eventState);
+      }
+    },
+    agents: {
+      get: () => live ? { status: running ? 'running' : 'idle' } : undefined,
+      async releaseIdle() {
+        assert.equal(running, false);
+        rows = live.snapshotEvents(); live = undefined;
+      },
+      async resume() {
+        assert.equal(leased, false);
+        live = restored();
+        const own = live;
+        return { agent: { session: own }, async dispose() { if (live === own) { rows = own.snapshotEvents(); live = undefined; } } };
+      }
+    },
+    sessionPersistence: {
+      async open(id, mode) {
+        assert.equal(mode, 'write'); assert.equal(live, undefined); assert.equal(leased, false); leased = true;
+        return { header, inheritedEventCount: 0,
+          async read(offset, count) { return { events: structuredClone(rows.slice(offset, offset + count)) }; },
+          async append(batch) { assert.equal(leased, true); assert.equal(batch[0]?.seq ?? rows.length, rows.length); rows = [...rows, ...batch]; },
+          async flush() { onFlush(rows); }, async close() { leased = false; } };
+      }
+    }
+  };
+  return { ctx, get session() { return live ?? { snapshotEvents: () => rows,
+    get surface() { return restored().surface; }, eventAt: seq => rows.find(e => e.seq === seq),
+    append(...args) { const next = restored(); const event = next.append(...args); rows = next.snapshotEvents(); return event; }
+  }; }, running: value => running = value };
+}
+
+test('removal refuses a corrupt turn sequence or failed owner release without appending', async () => {
+  for (const corrupt of [true, false]) {
+    const initial = Session.create('test', [message(0, 'keep')]);
+    if (corrupt) initial.append('turn/start', { turn: 3 });
+    let writes = 0;
+    const fixture = idleWriterFixture(initial, () => writes++), routes = new Map();
+    if (!corrupt) fixture.ctx.agents.releaseIdle = async () => { throw Error('owner still has child tasks'); };
+    const before = structuredClone(initial.snapshotEvents());
+    registerEditRoutes(fixture.ctx, (path, _methods, handler) => routes.set(path, handler), null);
+    const response = await routes.get('/api/session-editor/delete-node')(new Request('http://local/delete', {
+      method: 'POST', body: JSON.stringify({ id: 'test', seq: 0, expectRevision: contentRevision(before) })
+    }));
+    assert.equal(response.status, 500); assert.equal(writes, 0);
+    assert.deepEqual(fixture.session.snapshotEvents(), before);
+  }
 });
 
 test('three consecutive removals survive native chat projection and reopen without losing history', async () => {
@@ -229,12 +293,12 @@ test('three consecutive removals survive native chat projection and reopen witho
   ];
   const session = Session.create(header.id, rows, header);
   const routes = new Map(); let flushed;
-  registerEditRoutes({ sessions: { get: () => session, async flush(s) { flushed = s.snapshotEvents(); } },
-    agents: { get: () => ({ status: 'idle' }) } }, (p, _m, h) => routes.set(p, h), null);
+  const fixture = idleWriterFixture(session, rows => flushed = rows);
+  registerEditRoutes(fixture.ctx, (p, _m, h) => routes.set(p, h), null);
   const replacements = [];
   for (const seq of [5, 6, 7]) {
     const response = await routes.get('/api/session-editor/delete-node')(new Request('http://local/delete', {
-      method: 'POST', body: JSON.stringify({ id: header.id, seq, expectRevision: contentRevision(session.snapshotEvents()) })
+      method: 'POST', body: JSON.stringify({ id: header.id, seq, expectRevision: contentRevision(fixture.session.snapshotEvents()) })
     }));
     const result = await response.json(); assert.equal(response.status, 200, JSON.stringify(result));
     replacements.push(result.edit.newSeq);
@@ -259,12 +323,12 @@ function boundaryFixture() {
   session.append('system/message', { turn: 1, step: 1, message: { id: 'system', role: 'system', source: { kind: 'system-prompt' }, content: [] } }, { surfaceOp: 'append' });
   session.append('step/end', { turn: 1, step: 1 }); session.append('turn/end', { turn: 1, reason: { kind: 'completed' } });
   const target = session.append('user/message', message(0, 'memory').data, { surfaceOp: 'append' }).seq;
-  let running = false;
   const routes = new Map();
-  registerEditRoutes({ sessions: { get: () => session, flush: async () => {} }, agents: { get: () => ({ status: running ? 'running' : 'idle' }) } }, (p, _m, h) => routes.set(p, h), null);
-  return { session, target, running: value => running = value,
+  const fixture = idleWriterFixture(session);
+  registerEditRoutes(fixture.ctx, (p, _m, h) => routes.set(p, h), null);
+  return { get session() { return fixture.session; }, target, running: fixture.running,
     call: (route, body) => routes.get('/api/session-editor' + route)(new Request('http://local' + route, { method: 'POST', body: JSON.stringify({ id: header.id, ...body }) })),
-    validate: () => { const events = session.snapshotEvents(); Session.create(header.id, events, header);
+    validate: () => { const events = fixture.session.snapshotEvents(); Session.create(header.id, events, header);
       assertReleasedV4Relationships({ header, events, inheritedEventCount: 0 }, new Set(events.map(e => e.type))); projectTurnFooters(events); } };
 }
 
@@ -301,8 +365,27 @@ test('legacy mutation gates reject running, stale, archived and summary targets 
   f.session.append('user/message', original.data, { surfaceOp: { op: 'replace', startSeq: f.target, endSeq: f.target }, sourceEventSeqs: [f.target] });
   await unchanged('/edit', { seq: f.target, blocks: [] }, 409);
   // The ordinary editing API must never duplicate a compaction checkpoint.
-  const routes = new Map(); const summary = { ...message(0, 'summary'), data: { ...message(0, '').data, source: { kind: 'compact-checkpoint', compactionId: 'c' } } };
-  registerEditRoutes({ sessions: { get: () => ({ snapshotEvents: () => [summary], eventAt: () => summary, surface: { nodes: [0], contentGeneration: 0 }, append: () => { throw Error('must not append checkpoint'); } }) }, agents: { get: () => ({ status: 'idle' }) } }, (p, _m, h) => routes.set(p, h), null);
-  const r = await routes.get('/api/session-editor/edit')(new Request('http://local/edit', { method: 'POST', body: JSON.stringify({ id: 'test', seq: 0, blocks: [] }) }));
+  const routes = new Map();
+  const rows = [message(0, 'original'),
+    { seq: 1, time: 1, type: 'compaction/start', data: { compactionId: 'c', turn: null } },
+    { seq: 2, time: 1, type: 'compaction/summary', data: { compactionId: 'c', summary: [{ type: 'text', text: 'summary' }], shadowedRange: { start: 0, end: 0 }, shadowedSeqs: [0], shadowedTokenCount: 1 } },
+    { ...message(3, '<compacted-summary>summary</compacted-summary>', 0), data: { ...message(3, '<compacted-summary>summary</compacted-summary>').data, source: { kind: 'compact-checkpoint', compactionId: 'c' } } },
+    { seq: 4, time: 1, type: 'compaction/end', data: { compactionId: 'c', turn: null } }];
+  const fixture = idleWriterFixture(Session.create('test', rows));
+  const before = fixture.session.snapshotEvents();
+  registerEditRoutes(fixture.ctx, (p, _m, h) => routes.set(p, h), null);
+  const r = await routes.get('/api/session-editor/edit')(new Request('http://local/edit', { method: 'POST', body: JSON.stringify({ id: 'test', seq: 3, blocks: [] }) }));
   assert.equal(r.status, 422, await r.text());
+  assert.deepEqual(fixture.session.snapshotEvents(), before);
+});
+
+test('insert without a same-role template uses a valid developer identity and refuses an invalid assistant', async () => {
+  const f = boundaryFixture();
+  const inserted = await f.call('/insert', { role: 'developer', blocks: [{ type: 'text', text: 'developer marker' }], expectRevision: contentRevision(f.session.snapshotEvents()) });
+  assert.equal(inserted.status, 200, await inserted.text());
+  f.validate();
+  const before = f.session.snapshotEvents();
+  const response = await f.call('/insert', { role: 'assistant', blocks: [{ type: 'text', text: 'missing settlement template' }], expectRevision: contentRevision(before) });
+  assert.equal(response.status, 422, await response.text());
+  assert.deepEqual(f.session.snapshotEvents(), before);
 });

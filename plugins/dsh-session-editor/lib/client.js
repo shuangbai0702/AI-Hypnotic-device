@@ -248,13 +248,13 @@ window.__ModuleLoader__.load({
           if (editing.checkpoint) await post("/summary/edit", { id: sessionId, seq: editing.seq, text: editing.text, expectRevision: editing.revision });
           else await post("/edit", { id: sessionId, seq: editing.seq, blocks: editedBlocks(editing.blocks, editing.text, editing.clearThoughts, editing.thoughts), physical: true, expectRevision: editing.revision });
           if (!alive.current) return;
-          setEditing(null);
-          onChanged();
           try {
             await refreshConversation(sessionId);
             if (alive.current) setNotice("已保存，上下文与左侧会话已更新");
           } catch (e) {
             if (alive.current) setErr("内容已保存，左侧同步失败；请点“同步左侧”重试：" + e.message);
+          } finally {
+            if (alive.current) { setEditing(null); onChanged(); }
           }
         } catch (e) { if (alive.current) setErr(e.message); }
         finally { saving.current = false; if (alive.current) setBusy(false); }
@@ -263,7 +263,18 @@ window.__ModuleLoader__.load({
       const del = useCallback(async (seq) => {
         if (saving.current) return;
         saving.current = true; setBusy(true); setErr(''); setNotice('');
-        try { await post("/delete-node", { id: sessionId, seq, expectRevision: data.contentRevision }); if (alive.current) { onChanged(); setNotice("已从模型上下文移除，原始聊天记录仍保留"); } }
+        try {
+          await post("/delete-node", { id: sessionId, seq, expectRevision: data.contentRevision });
+          if (!alive.current) return;
+          try {
+            await refreshConversation(sessionId);
+            if (alive.current) setNotice("已从模型上下文移除，原始聊天记录仍保留");
+          } catch (e) {
+            if (alive.current) setErr("移出已保存，左侧同步失败；请点“同步左侧”重试：" + e.message);
+          } finally {
+            if (alive.current) onChanged();
+          }
+        }
         catch (e) { if (alive.current) setErr(e.message); }
         finally { saving.current = false; if (alive.current) setBusy(false); }
       }, [sessionId, onChanged, data]);
@@ -345,12 +356,13 @@ window.__ModuleLoader__.load({
           setErr(""); setNotice("");
           await post("/summary/edit", { id: sessionId, seq: editing.seq, text: editing.text, expectRevision: editing.revision });
           if (!alive.current) return;
-          setEditing(null); onChanged();
           try {
             await refreshConversation(sessionId);
             if (alive.current) setNotice("摘要已保存，左侧会话已更新");
           } catch (e) {
             if (alive.current) setErr("摘要已保存，左侧同步失败；请点“同步左侧”重试：" + e.message);
+          } finally {
+            if (alive.current) { setEditing(null); onChanged(); }
           }
         } catch (e) { if (alive.current) setErr(e.message); }
         finally { saving.current = false; if (alive.current) setBusy(false); }
@@ -483,7 +495,11 @@ window.__ModuleLoader__.load({
             if (stamp !== epoch.current) return;
             setTask('');
           }
-          if (data.changeCount) { onChanged(); try { await refreshConversation(sessionId); } catch (e) { if (stamp === epoch.current) setError('记忆已修改，目标聊天同步失败：' + e.message); } }
+          if (data.changeCount) {
+            try { await refreshConversation(sessionId); }
+            catch (e) { if (stamp === epoch.current) setError('记忆已修改，目标聊天同步失败：' + e.message); }
+            finally { if (stamp === epoch.current) onChanged(); }
+          }
         } catch (e) {
           if (stamp === epoch.current) { owned.current?.release(); owned.current = null; setReference(null); setError(e.message); }
         } finally { pending.current = false; if (stamp === epoch.current) setBusy(false); }
@@ -499,9 +515,9 @@ window.__ModuleLoader__.load({
             setInfo(data);
             if (data.changeCount !== changes.current) {
               changes.current = data.changeCount;
-              onChanged();
               try { await refreshConversation(sessionId); }
               catch (e) { if (active) setError('记忆已修改，目标聊天同步失败：' + e.message); }
+              finally { if (active) onChanged(); }
             }
           } catch (e) { if (active && e.name !== 'AbortError') setError(e.message); }
           finally { if (active) timer = setTimeout(poll, 900); }
@@ -569,10 +585,13 @@ window.__ModuleLoader__.load({
       const apply = async candidate => {
         const result = await post('/workbench/apply', { id: sessionId, candidateId: candidate.candidateId });
         if (!alive.current) return;
-        setNotice(result.warning || '已应用，原件仍保留。'); onChanged();
         // Business success is separate from native conversation synchronization.
         try { await refreshConversation(sessionId); }
         catch (e) { if (alive.current) setError('内容已保存，左侧同步失败：' + e.message + '。可点击上方“同步左侧”，无需重复应用。'); }
+        finally {
+          // Native reopen may append a restore marker; read revisions after it settles.
+          if (alive.current) { setNotice(result.warning || '已应用，原件仍保留。'); onChanged(); }
+        }
       };
       const search = async offset => {
         const result = await api('/workbench/originals?id=' + encodeURIComponent(sessionId) + '&query=' + encodeURIComponent(query) + '&offset=' + offset);
@@ -682,7 +701,7 @@ window.__ModuleLoader__.load({
           h("span", { style: sty.help }, "归档原文只读 · 生效摘要可编辑 · 保存自动同步")),
         h("details", { style: sty.details }, h("summary", null, "更多工具与使用说明"),
           h('div', { style: sty.row }, ['coverage', 'history'].map(tabButton),
-            h("button", { style: sty.btn, onClick: async () => { const target = sessionId; setSyncError(""); try { await refreshConversation(target); } catch (e) { if (alive.current && target === currentSessionId()) setSyncError(e.message); } } }, "同步左侧")),
+            h("button", { style: sty.btn, onClick: async () => { const target = sessionId; setSyncError(""); try { await refreshConversation(target); } catch (e) { if (alive.current && target === currentSessionId()) setSyncError(e.message); } finally { if (alive.current && target === currentSessionId()) onChanged(); } } }, "同步左侧")),
           h("div", { style: sty.row },
             h("span", { style: { color: '#475467', background: '#F2F4F7', padding: '3px 6px', borderRadius: 4 } }, "灰 · 整条已被摘要替代"),
             h("span", { style: { color: '#067647', background: '#ECFDF3', padding: '3px 6px', borderRadius: 4 } }, "绿 · 整条未被摘要覆盖"),

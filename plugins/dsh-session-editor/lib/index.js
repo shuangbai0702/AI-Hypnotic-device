@@ -7,6 +7,7 @@
 //   sessionPersistence — 冷会话读取（append-only 日志句柄）
 //   sessionQuery       — 检索（M2 暂不强制）
 
+import { readFileSync } from "node:fs";
 import { registerEditRoutes } from "./edit.js";
 import { importHost } from "./host-import.js";
 import { contentRevision, summaryBody } from "./physical-edit.js";
@@ -18,7 +19,8 @@ export const name = "session-editor";
 
 export const inject = ["connection", "sessions", "sessionPersistence", "agents", "tools", "systemPrompt", "agentDefaultModel", "tokenMeter"];
 
-const PKG = { name: "@shuangbai/dsh-session-editor", version: "0.3.0" };
+const { name: packageName, version } = JSON.parse(readFileSync(new URL('../package.json', import.meta.url), 'utf8'));
+const PKG = { name: packageName, version };
 
 /** JSON 响应 */
 function json(value, status = 200) {

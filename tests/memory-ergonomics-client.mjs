@@ -51,3 +51,24 @@ test('tab navigation retains visited editor instances and uses four primary acti
   f.find(props,'有效上下文').props.onClick();
   assert.equal(walk(f.render(props)).find(n=>n.props.key==='target:context').props.hidden,false);
 });
+
+test('message and summary saves retain the editor until native sync settles, then refresh only the live view',async()=>{
+  for (const name of ['ContextView','SummaryView']) for (const leave of [false,true]) {
+    const gate=deferred(),alive={current:true};let changes=0,syncStarted=false;
+    const f=fixture(name,name==='ContextView'?'SummaryView':'CoverageView',{
+      useLifetime:()=>alive,post:async()=>({ok:true}),refreshConversation:async()=>{syncStarted=true;await gate.promise;},
+      editChanges:()=>['body'],editedBlocks:()=>[],messageLabel:()=> '用户消息',roleColor:()=> '#000',
+      visualFor:()=>({label:'有效'}),ChangePreview:()=>{},MessageBody:()=>{}
+    });
+    const message={seq:2,role:'user',tokens:1,editText:'old',blocks:[]};
+    f.state[0]={contentRevision:'r1',messages:[message],summaries:[message],messageCount:1,totalTokens:1};
+    f.state[2]={seq:2,text:'new',originalText:'old',revision:'r1',blocks:[]};
+    const props={sessionId:'target',reloadKey:0,onChanged:()=>changes++};
+    const run=f.find(props,name==='ContextView'?'保存':'保存摘要').props.onClick();
+    await new Promise(r=>setImmediate(r));assert.equal(syncStarted,true);assert.equal(changes,0);
+    assert.ok(f.state[2]);assert.equal(f.state[3],true);
+    if(leave)alive.current=false;
+    gate.resolve();await run;assert.equal(changes,leave?0:1);
+    if(!leave)assert.equal(f.state[2],null);
+  }
+});

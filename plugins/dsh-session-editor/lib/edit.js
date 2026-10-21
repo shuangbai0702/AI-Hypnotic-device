@@ -1,8 +1,9 @@
 // lib/edit.js — shuangbai session-editor: 编辑能力（M3+）
-// 全部通过官方 surface 契约实现：append + surfaceOp.replace，无核心补丁。
+// 通过 surface 替换和独占持久化写租约编辑；驻留 agent 由原生命周期所有者释放。
 import { createHash } from 'node:crypto';
 import { physicalEdit, setMessageBlocks, contentRevision } from './physical-edit.js';
 import { isCompactionCheckpoint } from './coverage.js';
+import { importHost } from './host-import.js';
 
 /** JSON 响应工具（与 index.js 相同约定） */
 export function json(value, status = 200) {
@@ -102,7 +103,8 @@ function messageData(type, role, blocks, template) {
   // system/developer/assistant 需要 {turn, step, message}
   const turn = template?.data?.turn ?? 1;
   const step = template?.data?.step ?? 1;
-  return { turn, step, message: { role, content: blocks, source: { kind: "session-editor" } } };
+  return { turn, step, message: { id: cryptoId(), role, content: blocks,
+    source: { kind: role === 'system' ? 'system-prompt' : 'session-editor' } } };
 }
 
 function cryptoId() {
@@ -117,6 +119,47 @@ export async function withSessionWrite(ctx, id, run) {
   if (pending.has(id)) throw Object.assign(new Error("此会话正在编辑，请稍后重试"), { status: 409 });
   pending.add(id);
   try { return await run(); } finally { pending.delete(id); }
+}
+
+// Synthetic turns must never be appended behind a resident loop's cached
+// phase.lastTurn. Release its actual owner, then append under an exclusive
+// persistence lease without creating another agent. The next prompt restores
+// both the log and loop position together.
+async function appendDetached(ctx, body, run) {
+  const { id, expectRevision, signal } = body;
+  signal?.throwIfAborted();
+  if (ctx.agents.get(id)?.status === 'running') throw Object.assign(new Error('会话正在生成，请停止生成后再编辑'), { status: 409 });
+  if (ctx.sessions.get(id)) {
+    if (typeof ctx.agents.releaseIdle !== 'function') throw new Error('当前宿主缺少安全释放接口；未修改会话');
+    await ctx.agents.releaseIdle(id);
+    attachedHandles.delete(id);
+  }
+  if (ctx.sessions.get(id)) throw new Error('会话仍被占用，未修改会话');
+  const writer = await ctx.sessionPersistence.open(id, 'write');
+  try {
+    const events = [];
+    for (;;) {
+      const part = await writer.read(events.length, 500);
+      events.push(...part.events);
+      if (part.events.length < 500) break;
+    }
+    signal?.throwIfAborted();
+    if (expectRevision && contentRevision(events) !== expectRevision) throw Object.assign(new Error('版本冲突：请刷新后重试'), { status: 409 });
+    const { assertReleasedV4Relationships } = await importHost('@deepseek-ai/dsh-session-format-v3-to-v4');
+    const validate = rows => assertReleasedV4Relationships({ header: writer.header, events: rows, inheritedEventCount: writer.inheritedEventCount }, new Set(rows.map(e => e.type)));
+    validate(events);
+    const session = ctx.sessions.prepare(id, { seed: structuredClone(events), meta: writer.header,
+      inheritedEventCount: writer.inheritedEventCount, eventState: 'detached' });
+    if (Number.isInteger(body.seq) && !session.surface.nodes.includes(body.seq)) throw Object.assign(new Error('目标已不在有效上下文，请刷新'), { status: 409 });
+    if (Number.isInteger(body.expectGeneration) && session.surface.contentGeneration !== body.expectGeneration) throw Object.assign(new Error('版本冲突：请刷新后重试'), { status: 409 });
+    const result = run(session);
+    const rows = session.snapshotEvents();
+    validate(rows);
+    signal?.throwIfAborted();
+    await writer.append(rows.slice(events.length));
+    await writer.flush();
+    return result;
+  } finally { await writer.close(); }
 }
 
 /** 编辑 API 路由注册 */
@@ -226,38 +269,28 @@ export function registerEditRoutes(ctx, route, computeOffline) {
     if (!id || !Number.isInteger(seq) || !Array.isArray(blocks)) return err("需要 id / seq / blocks");
     try {
       if (body.physical === true) return json(await physicalEdit(ctx, body, detachSession));
-      const { session, attached } = await acquireLiveSession(ctx, id);
-      if (ctx.agents.get(id)?.status === "running") return err("会话正在生成，请停止生成后再编辑", 409);
-      if (body.expectRevision && contentRevision(session.snapshotEvents()) !== body.expectRevision) return err("版本冲突：请刷新后重试", 409);
-      if (!session.surface.nodes.includes(seq)) return err("目标已不在有效上下文，请刷新", 409);
-      // 版本检查：contentGeneration 与事件位置
-      const generation = session.surface.contentGeneration;
-      if (Number.isInteger(expectGeneration) && generation !== expectGeneration) {
-        return err("版本冲突：会话内容已变化（contentGeneration 不一致）", 409, {
-          expectGeneration, currentGeneration: generation,
+      return json(await appendDetached(ctx, body, (detached) => {
+        const template = detached.eventAt(seq);
+        if (!template) throw Object.assign(new Error(`seq ${seq} 不存在`), { status: 404 });
+        if (isCompactionCheckpoint(template)) throw Object.assign(new Error("压缩摘要请使用摘要编辑接口"), { status: 422 });
+        if (!["user/message", "assistant/message", "developer/message"].includes(template.type)) {
+          throw Object.assign(new Error(`seq ${seq} 类型 ${template.type} 不支持该编辑方式（system 由 DSH 每轮重建；tool 结构受保护）`), { status: 422 });
+        }
+        const { type, data } = buildReplacementEvent(detached.eventAt(seq), blocks);
+        const event = detached.append(type, data, {
+          surfaceOp: { op: "replace", startSeq: seq, endSeq: seq },
+          sourceEventSeqs: [seq],
         });
-      }
-      const template = session.eventAt(seq);
-      if (!template) return err(`seq ${seq} 不存在`, 404);
-      if (isCompactionCheckpoint(template)) return err("压缩摘要请使用摘要编辑接口", 422);
-      if (!["user/message", "assistant/message", "developer/message"].includes(template.type)) {
-        return err(`seq ${seq} 类型 ${template.type} 不支持该编辑方式（system 由 DSH 每轮重建；tool 结构受保护）`, 422);
-      }
-      const { type, data } = buildReplacementEvent(template, blocks);
-      const event = session.append(type, data, {
-        surfaceOp: { op: "replace", startSeq: seq, endSeq: seq },
-        sourceEventSeqs: [seq],
-      });
-      await ctx.sessions.flush(session);
-      return json({
-        ok: true,
-        attached,
-        edit: { targetSeq: seq, newSeq: event.seq, type },
-        generationAfter: session.surface.contentGeneration,
-        note: "replace 事件已落盘并广播；下一次 deriveMessages 即为新内容",
-      });
+        return {
+          ok: true,
+          attached: false,
+          edit: { targetSeq: seq, newSeq: event.seq, type },
+          generationAfter: detached.surface.contentGeneration,
+          note: "replace 事件已落盘并广播；下一次 deriveMessages 即为新内容",
+        };
+      }));
     } catch (e) {
-      return err(`edit failed: ${e?.message ?? e}`, 500);
+      return err(`edit failed: ${e?.message ?? e}`, e.status ?? 500);
     }
   });
 
@@ -267,56 +300,49 @@ export function registerEditRoutes(ctx, route, computeOffline) {
       const body = await request.json();
       const { id, seq, expectGeneration, expectRevision } = body ?? {};
       if (!id || !Number.isInteger(seq)) return err("需要 id / seq");
-      const { session } = await acquireLiveSession(ctx, id);
-      if (ctx.agents.get(id)?.status === "running") return err("会话正在生成，请停止生成后再移出", 409);
-      if (expectRevision && contentRevision(session.snapshotEvents()) !== expectRevision) return err("版本冲突：请刷新后重试", 409);
-      if (!session.surface.nodes.includes(seq)) return err("目标已不在有效上下文，请刷新", 409);
-      const generation = session.surface.contentGeneration;
-      if (Number.isInteger(expectGeneration) && generation !== expectGeneration) {
-        return err("版本冲突", 409, { expectGeneration, currentGeneration: generation });
-      }
-      // tombstone 也必须匹配 open turn/step：复用 insert 的补全序列
-      const events = session.snapshotEvents();
-      const openTurn = events.findLast((e) => e.type === "turn/start");
-      // Loading a seed does not close its interrupted turn or step in v4.
-      const closedAfter = events.findLast((e) => e.type === "turn/end");
-      const turnOpen = openTurn !== undefined && (closedAfter === undefined || closedAfter.seq < openTurn.seq);
-      let event;
-      if (turnOpen) {
-        const turnNo = openTurn.data?.turn ?? 1;
-        const boundary = events.findLast(e => ["step/start", "step/end"].includes(e.type) && e.data?.turn === turnNo);
-        const ownStep = boundary?.type !== "step/start";
-        const stepNo = ownStep ? (boundary?.data.step ?? 0) + 1 : boundary.data.step;
-        if (ownStep) session.append("step/start", { turn: turnNo, step: stepNo });
-        const sysTpl2 = cloneContractTemplate(events, "system/message");
-        const sysData2 = sysTpl2 ? JSON.parse(JSON.stringify(sysTpl2.data)) : { turn: turnNo, step: stepNo, message: { role: "system", id: cryptoId(), content: [], source: { kind: "session-editor" } } };
-        sysData2.turn = turnNo; sysData2.step = stepNo;
-        sysData2.message = { role: "system", id: cryptoId(), content: [], source: { kind: "system-prompt" } };
-        event = session.append("system/message", sysData2, {
-          surfaceOp: { op: "replace", startSeq: seq, endSeq: seq },
-          sourceEventSeqs: [seq],
-        });
-        if (ownStep) session.append("step/end", { turn: turnNo, step: stepNo });
-      } else {
-        const nextTurn = (openTurn?.data?.turn ?? 0) + 1;
-        session.append("turn/start", { turn: nextTurn });
-        session.append("step/start", { turn: nextTurn, step: 1 });
-        const sysTpl = cloneContractTemplate(events, "system/message");
-        const sysData = sysTpl ? JSON.parse(JSON.stringify(sysTpl.data)) : { turn: nextTurn, step: 1, message: { role: "system", id: cryptoId(), content: [], source: { kind: "session-editor" } } };
-        sysData.turn = nextTurn; sysData.step = 1;
-        sysData.message = { role: "system", id: cryptoId(), content: [], source: { kind: "system-prompt" } };
-        event = session.append("system/message", sysData, {
-          surfaceOp: { op: "replace", startSeq: seq, endSeq: seq },
-          sourceEventSeqs: [seq],
-        });
-        session.append("step/end", { turn: nextTurn, step: 1 });
-        // Native chat projections read reason.kind for every completed turn.
-        session.append("turn/end", { turn: nextTurn, reason: { kind: "completed" } });
-      }
-      await ctx.sessions.flush(session);
-      return json({ ok: true, edit: { targetSeq: seq, newSeq: event.seq }, note: "节点已从模型可见序列移除（空占位）" });
+      return json(await appendDetached(ctx, body, (session) => {
+        // tombstone 也必须匹配 open turn/step：复用 insert 的补全序列
+        const events = session.snapshotEvents();
+        const openTurn = events.findLast((e) => e.type === "turn/start");
+        // Loading a seed does not close its interrupted turn or step in v4.
+        const closedAfter = events.findLast((e) => e.type === "turn/end");
+        const turnOpen = openTurn !== undefined && (closedAfter === undefined || closedAfter.seq < openTurn.seq);
+        let event;
+        if (turnOpen) {
+          const turnNo = openTurn.data?.turn ?? 1;
+          const boundary = events.findLast(e => ["step/start", "step/end"].includes(e.type) && e.data?.turn === turnNo);
+          const ownStep = boundary?.type !== "step/start";
+          const stepNo = ownStep ? (boundary?.data.step ?? 0) + 1 : boundary.data.step;
+          if (ownStep) session.append("step/start", { turn: turnNo, step: stepNo });
+          const sysTpl2 = cloneContractTemplate(events, "system/message");
+          const sysData2 = sysTpl2 ? JSON.parse(JSON.stringify(sysTpl2.data)) : { turn: turnNo, step: stepNo, message: { role: "system", id: cryptoId(), content: [], source: { kind: "session-editor" } } };
+          sysData2.turn = turnNo; sysData2.step = stepNo;
+          sysData2.message = { role: "system", id: cryptoId(), content: [], source: { kind: "system-prompt" } };
+          event = session.append("system/message", sysData2, {
+            surfaceOp: { op: "replace", startSeq: seq, endSeq: seq },
+            sourceEventSeqs: [seq],
+          });
+          if (ownStep) session.append("step/end", { turn: turnNo, step: stepNo });
+        } else {
+          const nextTurn = (openTurn?.data?.turn ?? 0) + 1;
+          session.append("turn/start", { turn: nextTurn });
+          session.append("step/start", { turn: nextTurn, step: 1 });
+          const sysTpl = cloneContractTemplate(events, "system/message");
+          const sysData = sysTpl ? JSON.parse(JSON.stringify(sysTpl.data)) : { turn: nextTurn, step: 1, message: { role: "system", id: cryptoId(), content: [], source: { kind: "session-editor" } } };
+          sysData.turn = nextTurn; sysData.step = 1;
+          sysData.message = { role: "system", id: cryptoId(), content: [], source: { kind: "system-prompt" } };
+          event = session.append("system/message", sysData, {
+            surfaceOp: { op: "replace", startSeq: seq, endSeq: seq },
+            sourceEventSeqs: [seq],
+          });
+          session.append("step/end", { turn: nextTurn, step: 1 });
+          // Native chat projections read reason.kind for every completed turn.
+          session.append("turn/end", { turn: nextTurn, reason: { kind: "completed" } });
+        }
+        return { ok: true, edit: { targetSeq: seq, newSeq: event.seq }, note: "节点已从模型可见序列移除（空占位）" };
+      }));
     } catch (e) {
-      return err(`delete failed: ${e?.message ?? e}`, 500);
+      return err(`delete failed: ${e?.message ?? e}`, e.status ?? 500);
     }
   });
 
@@ -330,57 +356,56 @@ export function registerEditRoutes(ctx, route, computeOffline) {
       const typeMap = { user: "user/message", assistant: "assistant/message", system: "system/message", developer: "developer/message" };
       const type = typeMap[role];
       if (!type) return err(`role 必须是 ${Object.keys(typeMap).join('/')}`);
-      const { session } = await acquireLiveSession(ctx, id);
-      if (ctx.agents.get(id)?.status === "running") return err("会话正在生成，请停止生成后再插入", 409);
-      if (body.expectRevision && contentRevision(session.snapshotEvents()) !== body.expectRevision) return err("版本冲突：请刷新后重试", 409);
-      // v4 状态机：user 可在任何时刻追加；system/developer/assistant 必须在 open turn+step 内。
-      // 若当前无 open turn，则补全合法序列: turn/start → step/start → msg → step/end → turn/end
-      const events = session.snapshotEvents();
-      const openTurn = events.findLast((e) => e.type === "turn/start");
-      const closedAfter = events.findLast((e) => e.type === "turn/end");
-      const turnOpen = openTurn !== undefined && (closedAfter === undefined || closedAfter.seq < openTurn.seq);
-      let event;
-      // 契约模板：从日志最近一条同类型事件克隆（保证 v4 全字段合法）
-      const template = cloneContractTemplate(events, type);
-      if (role === "user") {
-        event = session.append("user/message", messageData("user/message", "user", blocks), { surfaceOp: "append" });
-      } else if (turnOpen) {
-        const turnNo = openTurn.data?.turn ?? 1;
-        const boundary = events.findLast(e => ["step/start", "step/end"].includes(e.type) && e.data?.turn === turnNo);
-        const ownStep = boundary?.type !== "step/start";
-        const stepNo = ownStep ? (boundary?.data.step ?? 0) + 1 : boundary.data.step;
-        if (ownStep) session.append("step/start", { turn: turnNo, step: stepNo });
-        if (template) {
-          const data = JSON.parse(JSON.stringify(template.data));
-          data.turn = turnNo; data.step = stepNo;
-          data.message.content = blocks;
-          data.message.id = cryptoId();
-          event = session.append(type, data, { surfaceOp: "append" });
+      return json(await appendDetached(ctx, body, (session) => {
+        // v4 状态机：user 可在任何时刻追加；system/developer/assistant 必须在 open turn+step 内。
+        // 若当前无 open turn，则补全合法序列: turn/start → step/start → msg → step/end → turn/end
+        const events = session.snapshotEvents();
+        const openTurn = events.findLast((e) => e.type === "turn/start");
+        const closedAfter = events.findLast((e) => e.type === "turn/end");
+        const turnOpen = openTurn !== undefined && (closedAfter === undefined || closedAfter.seq < openTurn.seq);
+        let event;
+        // 契约模板：从日志最近一条同类型事件克隆（保证 v4 全字段合法）
+        const template = cloneContractTemplate(events, type);
+        if (role === 'assistant' && !template) throw Object.assign(new Error('需要已有助手回复作为原生消息模板；未插入内容'), { status: 422 });
+        if (role === "user") {
+          event = session.append("user/message", messageData("user/message", "user", blocks), { surfaceOp: "append" });
+        } else if (turnOpen) {
+          const turnNo = openTurn.data?.turn ?? 1;
+          const boundary = events.findLast(e => ["step/start", "step/end"].includes(e.type) && e.data?.turn === turnNo);
+          const ownStep = boundary?.type !== "step/start";
+          const stepNo = ownStep ? (boundary?.data.step ?? 0) + 1 : boundary.data.step;
+          if (ownStep) session.append("step/start", { turn: turnNo, step: stepNo });
+          if (template) {
+            const data = JSON.parse(JSON.stringify(template.data));
+            data.turn = turnNo; data.step = stepNo;
+            data.message.content = blocks;
+            data.message.id = cryptoId();
+            event = session.append(type, data, { surfaceOp: "append" });
+          } else {
+            event = session.append(type, messageData(type, role, blocks, { data: { turn: turnNo, step: stepNo } }), { surfaceOp: "append" });
+          }
+          if (ownStep) session.append("step/end", { turn: turnNo, step: stepNo });
         } else {
-          event = session.append(type, messageData(type, role, blocks, { data: { turn: turnNo, step: stepNo } }), { surfaceOp: "append" });
+          // 无 open turn：完整 turn 序列；assistant 用克隆模板
+          const nextTurn = (openTurn?.data?.turn ?? 0) + 1;
+          session.append("turn/start", { turn: nextTurn });
+          session.append("step/start", { turn: nextTurn, step: 1 });
+          if (template) {
+            const data = JSON.parse(JSON.stringify(template.data));
+            data.turn = nextTurn; data.step = 1;
+            data.message.content = blocks;
+            data.message.id = cryptoId();
+            event = session.append(type, data, { surfaceOp: "append" });
+          } else {
+            event = session.append(type, messageData(type, role, blocks, { data: { turn: nextTurn, step: 1 } }), { surfaceOp: "append" });
+          }
+          session.append("step/end", { turn: nextTurn, step: 1 });
+          session.append("turn/end", { turn: nextTurn, reason: { kind: "completed" } });
         }
-        if (ownStep) session.append("step/end", { turn: turnNo, step: stepNo });
-      } else {
-        // 无 open turn：完整 turn 序列；assistant 用克隆模板
-        const nextTurn = (openTurn?.data?.turn ?? 0) + 1;
-        session.append("turn/start", { turn: nextTurn });
-        session.append("step/start", { turn: nextTurn, step: 1 });
-        if (template) {
-          const data = JSON.parse(JSON.stringify(template.data));
-          data.turn = nextTurn; data.step = 1;
-          data.message.content = blocks;
-          data.message.id = cryptoId();
-          event = session.append(type, data, { surfaceOp: "append" });
-        } else {
-          event = session.append(type, messageData(type, role, blocks, { data: { turn: nextTurn, step: 1 } }), { surfaceOp: "append" });
-        }
-        session.append("step/end", { turn: nextTurn, step: 1 });
-        session.append("turn/end", { turn: nextTurn, reason: { kind: "completed" } });
-      }
-      await ctx.sessions.flush(session);
-      return json({ ok: true, seq: event.seq, note: "已插入并进入模型上下文" });
+        return { ok: true, seq: event.seq, note: "已插入并进入模型上下文" };
+      }));
     } catch (e) {
-      return err(`insert failed: ${e?.message ?? e}`, 500);
+      return err(`insert failed: ${e?.message ?? e}`, e.status ?? 500);
     }
   });
 
