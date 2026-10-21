@@ -1,0 +1,12 @@
+{
+  "name": "shuangbai-dsh",
+  "version": "0.3.0",
+  "private": true,
+  "description": "DSH session context editor and Windows installer",
+  "scripts": {
+    "test": "node --test tests/memory-workbench.mjs tests/workbench-client.mjs tests/memory-assistant.mjs tests/context-coverage.mjs tests/session-editor-regression.mjs tests/assistant-edit-wire.mjs tests/memory-ergonomics-client.mjs",
+    "check:release": "node scripts/check-release.mjs",
+    "build:windows": "powershell.exe -NoProfile -ExecutionPolicy Bypass -File packaging/windows/Build.ps1"
+  },
+  "engines": { "node": ">=24" }
+}
