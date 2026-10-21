@@ -1,4 +1,4 @@
-# 双白 DSH · 会话记忆编辑器
+# AI Hypnotic device
 
 在 DeepSeek Harness（DSH）网页中编辑有效上下文、旧助手回复和生效摘要，用局部压缩整理记忆，并通过独立记忆助手辅助修改。
 
@@ -6,7 +6,7 @@
 
 ## 安装使用
 
-1. 从本仓库 [Releases](https://github.com/shuangbai0702/shuangbai-dsh/releases/latest) 下载 Windows 安装包 ZIP，**完整解压**。
+1. 从本仓库 [Releases](https://github.com/shuangbai0702/AI-Hypnotic-device/releases/latest) 下载 Windows 安装包 ZIP，**完整解压**。
 2. 双击 `双白DSH安装器.exe`，保留同目录的 `source/` 和 `plugin/`。
 3. 核对自动识别的 **DSH 程序目录、DSH 数据目录及端口**，点击“安装并启动”。默认端口为 `3080`；自定义数据目录请选原服务使用的 `DSH_HOME`。
 4. 在 DSH 网页会话右侧打开 **+ → 编辑器**。
