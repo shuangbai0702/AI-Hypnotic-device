@@ -1,4 +1,4 @@
-param([string]$OutputDirectory)
+﻿param([string]$OutputDirectory)
 $ErrorActionPreference='Stop'
 $project=Split-Path -Parent (Split-Path -Parent $PSScriptRoot)
 $packagedRoot=Split-Path -Parent $PSScriptRoot
@@ -9,7 +9,7 @@ New-Item -ItemType Directory -Force -Path $release,(Join-Path $release 'source')
 $plugin=if($packaged){Join-Path $packagedRoot 'plugin'}else{Join-Path $project 'plugins/dsh-session-editor'}
 foreach($name in @('package.json','README.md','AGENT.md','install.mjs','host-adapter.mjs')) { Copy-Item -LiteralPath (Join-Path $plugin $name) -Destination (Join-Path $release "plugin/$name") -Force }
 foreach($file in Get-ChildItem -LiteralPath (Join-Path $plugin 'lib') -File) { if($file.Extension -in '.js','.mjs') { Copy-Item -LiteralPath $file.FullName -Destination (Join-Path $release 'plugin/lib') -Force } }
-foreach($name in @('Installer.ps1','Build.ps1')) { [IO.File]::WriteAllText((Join-Path $release "source/$name"),[IO.File]::ReadAllText((Join-Path $PSScriptRoot $name)),(New-Object Text.UTF8Encoding($true))) }
+foreach($name in @('Installer.ps1','Build.ps1','Discovery.ps1')) { [IO.File]::WriteAllText((Join-Path $release "source/$name"),[IO.File]::ReadAllText((Join-Path $PSScriptRoot $name)),(New-Object Text.UTF8Encoding($true))) }
 Copy-Item -LiteralPath (Join-Path $PSScriptRoot 'Launcher.cs') -Destination (Join-Path $release 'source/Launcher.cs') -Force
 $readme=if($packaged){Join-Path $packagedRoot '使用说明.md'}else{Join-Path $PSScriptRoot 'README.md'}
 Copy-Item -LiteralPath $readme -Destination (Join-Path $release '使用说明.md') -Force

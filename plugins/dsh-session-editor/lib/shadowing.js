@@ -15,27 +15,12 @@ import { isCompactionCheckpoint } from './coverage.js';
 //   但若区间含多条消息（如 8..36 含 8 条），则"哪一句对应摘要哪一句"无法精确证明——
 //   此时必须如实返回整个区间 + 单一接续者，并标注不确定性。
 
-import { zstdDecompressSync, zstdCompressSync } from 'node:zlib';
-import { readFileSync, writeFileSync, renameSync, statSync, copyFileSync, mkdirSync } from 'node:fs';
+import { zstdCompressSync } from 'node:zlib';
+import { readFileSync, writeFileSync, renameSync, copyFileSync, mkdirSync, openSync, fsyncSync, closeSync, rmSync } from 'node:fs';
 import { join, basename, dirname } from 'node:path';
-
-const MAGIC = Buffer.from([0x28, 0xb5, 0x2f, 0xfd]);
-
-export function decodeLogBuf(buf) {
-  if (!buf.subarray(0, 4).equals(MAGIC)) return buf.toString('utf8');
-  let off = 0, text = '';
-  for (;;) {
-    const i = buf.indexOf(MAGIC, off);
-    if (i < 0) break;
-    try { text += zstdDecompressSync(buf.subarray(i)).toString('utf8'); } catch { /* torn */ }
-    off = i + 4;
-  }
-  return text;
-}
-
-export function parseRows(text) {
-  return text.split('\n').filter(Boolean).flatMap((l) => { try { return [JSON.parse(l)]; } catch { return []; } });
-}
+import { randomUUID } from 'node:crypto';
+import { decodeLogBuf, parseRows, assertSequence } from './log-codec.js';
+export { decodeLogBuf, parseRows } from './log-codec.js';
 
 const SURFACE_TYPES = new Set(["system/message", "developer/message", "user/message", "assistant/message", "tool/result"]);
 
@@ -140,6 +125,7 @@ export function classifyAll(trace) {
 export function loadSession(dir) {
   const file = join(dir, 'session.v4.jsonl.zstd');
   const events = parseRows(decodeLogBuf(readFileSync(file)));
+  assertSequence(events);
   const trace = buildTrace(events);
   return { events, trace, file };
 }
@@ -152,19 +138,25 @@ const HERE2 = dirname(fileURLToPath(import.meta.url));
 const BACKUP_DIR2 = join(HERE2, "..", "..", "..", "backups", "physical-sync");
 
 export function writeValidatedEvents(sessionDir, events) {
-  const hasHeader = events[0]?.type === 'session';
-  for (let i = hasHeader ? 1 : 0; i < events.length; i++) {
-    const want = hasHeader ? i - 1 : i;
-    if (events[i].seq !== want) throw new Error(`seq 断裂 at 位置 ${i}: ${events[i].seq} != ${want}`);
-  }
+  assertSequence(events);
   const out = Buffer.concat(events.map((e) => zstdCompressSync(Buffer.from(JSON.stringify(e) + '\n', 'utf8'))));
   const file = join(sessionDir, 'session.v4.jsonl.zstd');
+  // Never replace a source that could only be partially read. Caller holds the
+  // native write lease; check the complete source again before taking a backup.
+  loadSession(sessionDir);
   const backupDir = process.env.DSH_HOME ? join(process.env.DSH_HOME, "backups", "physical-sync") : BACKUP_DIR2;
   mkdirSync(backupDir, { recursive: true });
-  copyFileSync(file, join(backupDir, `${basename(sessionDir)}-${Date.now()}.zstd`));
-  const tmp = file + '.psync-tmp';
-  writeFileSync(tmp, out);
-  if (statSync(tmp).size === 0) throw new Error('空文件');
-  renameSync(tmp, file);
+  const nonce = randomUUID();
+  copyFileSync(file, join(backupDir, `${basename(sessionDir)}-${Date.now()}-${nonce}.zstd`));
+  const tmp = file + '.' + nonce + '.psync-tmp';
+  try {
+    writeFileSync(tmp, out, { flag: 'wx' });
+    const fd = openSync(tmp, 'r+');
+    try { fsyncSync(fd); } finally { closeSync(fd); }
+    const round = parseRows(decodeLogBuf(readFileSync(tmp)));
+    assertSequence(round);
+    if (JSON.stringify(round) !== JSON.stringify(events)) throw new Error('完整读回不一致，拒绝替换');
+    renameSync(tmp, file);
+  } finally { rmSync(tmp, { force: true }); }
   return createHash('sha256').update(readFileSync(file)).digest('hex');
 }

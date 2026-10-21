@@ -22,6 +22,7 @@
 /packaging/windows/*
 !/packaging/windows/Build.ps1
 !/packaging/windows/Installer.ps1
+!/packaging/windows/Discovery.ps1
 !/packaging/windows/Launcher.cs
 !/packaging/windows/README.md
 !/scripts/
@@ -37,10 +38,18 @@
 !/tests/assistant-edit-wire.mjs
 !/tests/memory-ergonomics-client.mjs
 !/tests/native-chat-projection.mjs
+!/tests/storage-integrity.mjs
+!/tests/installer-transaction.mjs
+!/tests/native-session-e2e.mjs
+!/tests/windows-installation-e2e.ps1
+!/tests/windows-discovery.ps1
+!/tests/windows-health-rollback.ps1
 !/docs/
 /docs/*
 !/docs/VALIDATION.md
 !/docs/GITHUB-PUBLISH-PLAN.md
+!/docs/RELIABILITY-PLAN.md
+!/docs/RELIABILITY-VALIDATION.md
 
 # Never include runtime secrets or machine-specific dependency links.
 **/node_modules/

@@ -46,7 +46,7 @@
 
 ## 安装
 
-当前支持 **DSH 0.2.0-rc.2 本项目使用的构建**，Node.js 需支持 zstd（本项目使用 Node 24）。安装器核对宿主文件 SHA256；不同构建会拒绝安装，不尝试猜测性修改。
+源码适配五个官方构建：DSH 0.1.7-rc.2、0.2.0-rc.1、0.2.0-rc.2、0.2.1-rc.1、0.2.1-rc.2；各版本实测层级见仓库可靠性验证。Node.js 至少为 24。安装器核对宿主文件 SHA256 及结构锚点；不同构建会拒绝安装，不尝试猜测性修改。
 
 先停止目标 DSH 服务。解压发布 tgz（包含 package 目录），执行一次：
 
@@ -54,7 +54,9 @@
 node package/install.mjs --app "D:/path/to/dsh" --home "D:/path/to/dsh-home"
 ```
 
-`--app` 是包含 lib/bin.js 和 node_modules 的 **DSH 程序目录**；`--home` 是该服务的 **DSH_HOME**。不写死端口、盘符或个人用户目录。安装器复制插件、注册 web profile、安装生命周期适配。启动原来的 DSH 即可使用。
+`--app` 是包含 lib/bin.js 的 **DSH 程序目录**，依赖按所选宿主实际模块解析路径定位，支持 npm 提升安装；`--home` 是该服务的 **DSH_HOME**。安装器结构化修改 YAML，兼容默认 `[]`。命令行直接调用只确认文件事务，不能代表网页已启动；Windows EXE 会进一步验证网页和插件健康。
+
+`--check` 只读预检；`--defer-health` 提交后保留待验证事务，服务健康通过后执行 `--complete`。失败或进程中断时先停止目标服务，再执行同样 app/home 参数并加 `--recover` 回滚。若文件有第三方改动，会保留事务及备份并拒绝覆盖。同一宿主只能绑定一个活动安装数据目录。
 
 适配修改 dsh-agent 和 dsh-agent-loop 的构建文件，增加“经原 Owner 释放空闲会话”的接口；另适配 dsh-api-session-controller 的客户端重载，成功重开后恢复可用状态。上下文组装、模型思考回传、工具调用与压缩算法沿用 DSH 原逻辑。宿主升级可能覆盖适配；升级后需安装兼容版本。
 
@@ -66,6 +68,6 @@ node package/install.mjs --app "D:/path/to/dsh" --home "D:/path/to/dsh-home"
 node package/install.mjs --app "D:/path/to/dsh" --home "D:/path/to/dsh-home" --uninstall
 ```
 
-恢复宿主原文件及安装前配置/插件；卸下的包归档到 DSH_HOME/.session-editor-install。若安装后宿主或配置又有其他修改，拒绝覆盖。会话内容不会随卸载回滚；如需回滚消息，可使用对应的历史备份。
+恢复宿主原文件及安装前配置/插件；卸下的包保存在 DSH_HOME/.session-editor-transactions 的事务快照中。若安装后宿主或配置又有其他修改，拒绝覆盖。会话内容不会随卸载回滚；如需回滚消息，可使用对应的历史备份。旧 log-rewrite.mjs 仅保留 inspect 只读诊断；其直接写入、恢复及贪婪修复命令已禁用，所有会话改写须经过网页编辑器的原生写租约和完整校验。
 
 当前版本不提供插入消息 GUI、所有历史备份的通用恢复浏览器或历史虚拟列表。候选审核及候选快照的字段恢复已提供。已被压缩的原文只读，通过生效摘要调整后续上下文。其他已打开的页面需自行同步或刷新。

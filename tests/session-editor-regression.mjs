@@ -169,6 +169,7 @@ test("physical sync releases live owner, holds write lease, validates and keeps 
 test("install, reinstall, uninstall preserve host bytes; unknown builds are rejected", () => {
   const root = mkdtempSync(join(tmpdir(), "dsh-editor-install-"));
   const app = join(root, "app"), home = join(root, "home");
+  cpSync(resolve('app/node_modules/js-yaml'), join(app, 'node_modules/js-yaml'), { recursive: true });
   const files = ["dsh-agent", "dsh-agent-loop"].map((pkg) => `node_modules/@deepseek-ai/${pkg}/lib/index.js`);
   files.push("node_modules/@deepseek-ai/dsh-api-session-controller/lib/client.js");
   for (const file of files) { mkdirSync(join(app, file, ".."), { recursive: true }); cpSync(resolve("app", file), join(app, file)); }
