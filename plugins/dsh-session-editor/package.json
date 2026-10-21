@@ -1,7 +1,7 @@
 {
   "name": "@shuangbai/dsh-session-editor",
   "description": "Session context/history/summary editor for shuangbai-dsh",
-  "version": "0.3.0",
+  "version": "0.3.1",
   "bin": { "dsh-session-editor-install": "./install.mjs" },
   "files": ["lib/*.js", "lib/log-rewrite.mjs", "install.mjs", "host-adapter.mjs", "README.md", "AGENT.md"],
   "type": "module",
