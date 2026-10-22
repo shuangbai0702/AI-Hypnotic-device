@@ -14,6 +14,7 @@ import { contentRevision, summaryBody } from "./physical-edit.js";
 import { contextCoverage, isCompactionCheckpoint } from "./coverage.js";
 import { registerMemoryAssistant } from "./memory-assistant.js";
 import { registerWorkbench, compressionRanges } from "./workbench.js";
+import { getDiagnostics, captureError } from './diagnostics.js';
 
 export const name = "session-editor";
 
@@ -21,6 +22,7 @@ export const inject = ["connection", "sessions", "sessionPersistence", "agents",
 
 const { name: packageName, version } = JSON.parse(readFileSync(new URL('../package.json', import.meta.url), 'utf8'));
 const PKG = { name: packageName, version };
+const { getDshRuntimeVersion } = await importHost('@deepseek-ai/dsh-app-boot');
 
 /** JSON 响应 */
 function json(value, status = 200) {
@@ -30,7 +32,8 @@ function json(value, status = 200) {
   });
 }
 
-function err(message, status = 400, extra = {}) {
+function err(message, status = 400, extra = {}, cause) {
+  captureError(cause ?? new Error(message));
   return json({ error: message, ...extra }, status);
 }
 
@@ -79,16 +82,36 @@ async function readAllEvents(sessionPersistence, sessionId) {
 }
 
 export function apply(ctx, config = {}) {
+  const diagnostics = getDiagnostics(ctx, PKG, getDshRuntimeVersion());
   const handlers = new Map();
   const route = (path, methods, handler) => {
-    for (const method of methods) handlers.set(`${method} ${path}`, handler);
-    return ctx.connection.fetch.register({ path, methods, requestBody: "buffered", fetch: handler });
+    const wrapped = diagnostics.wrap(path, handler);
+    for (const method of methods) handlers.set(`${method} ${path}`, wrapped);
+    return ctx.connection.fetch.register({ path, methods, requestBody: "buffered", fetch: wrapped });
   };
   const dispatch = (request) => {
     const handler = handlers.get(`${request.method} ${new URL(request.url).pathname}`);
     return handler ? handler(request) : err("route not found", 404);
   };
 
+  route('/api/session-editor/diagnostics', ['GET'], async () => json({ ok: true, ...diagnostics.status() }));
+  route('/api/session-editor/diagnostics/client-error', ['POST'], async request => {
+    try {
+      const body = await request.json();
+      if (!['api-network', 'conversation-sync', 'diagnostic-download'].includes(body.operation)) return err('invalid client operation');
+      const error = body.error ?? {};
+      // Never accept message bodies or arbitrary diagnostic fields from a browser.
+      const diagnosticId = diagnostics.clientError(body.operation, {
+        name: typeof error.name === 'string' ? error.name.slice(0, 64) : 'Error',
+        code: typeof error.code === 'string' ? error.code.slice(0, 64) : undefined,
+        stack: typeof error.stack === 'string' ? error.stack.slice(0, 12000) : ''
+      }, typeof body.id === 'string' ? body.id : undefined);
+      return json({ok: true, diagnosticId});
+    } catch (error) { return err('invalid client diagnostic', 400, {}, error); }
+  });
+  route('/api/session-editor/diagnostics/export', ['GET'], async () => new Response(JSON.stringify(diagnostics.export(), null, 2), {
+    headers: { 'content-type': 'application/json; charset=utf-8', 'content-disposition': 'attachment; filename="session-editor-diagnostics.json"', 'cache-control': 'no-store' }
+  }));
   // ---------- status ----------
   route("/api/session-editor/status", ["GET", "HEAD"], async () => {
     const services = {};
@@ -99,7 +122,8 @@ export function apply(ctx, config = {}) {
       ok: true,
       plugin: PKG,
       services,
-      startedAt: new Date().toISOString(),
+      startedAt: diagnostics.status().startedAt,
+      diagnostics: diagnostics.status(),
     });
   });
 
@@ -119,7 +143,7 @@ export function apply(ctx, config = {}) {
         })),
       });
     } catch (e) {
-      return err(`list failed: ${e?.message ?? e}`, 500);
+      return err(`list failed: ${e?.message ?? e}`, 500, {}, e);
     }
   });
 
@@ -143,7 +167,7 @@ export function apply(ctx, config = {}) {
       }));
       return json({ ok: true, header: { id: header.id, cwd: header.cwd, createdAt: header.createdAt }, inheritedEventCount, total: events.length, events: slim });
     } catch (e) {
-      return err(`read failed: ${e?.message ?? e}`, 500);
+      return err(`read failed: ${e?.message ?? e}`, 500, {}, e);
     }
   });
 
@@ -163,7 +187,7 @@ export function apply(ctx, config = {}) {
     try {
       const { events, fold, deriveEventMessage } = await computeSurface(id);
       return json({ ok: true, ...contextCoverage(events, fold, deriveEventMessage) });
-    } catch (e) { return err(`coverage failed: ${e?.message ?? e}`, 500); }
+    } catch (e) { return err(`coverage failed: ${e?.message ?? e}`, 500, {}, e); }
   });
 
   // surface：节点顺序 + 生成计数
@@ -182,7 +206,7 @@ export function apply(ctx, config = {}) {
         nodes: fold.nodes.map((seq) => ({ seq, type: events[seq]?.type })),
       });
     } catch (e) {
-      return err(`surface failed: ${e?.message ?? e}`, 500);
+      return err(`surface failed: ${e?.message ?? e}`, 500, {}, e);
     }
   });
 
@@ -243,7 +267,7 @@ export function apply(ctx, config = {}) {
         messages,
       });
     } catch (e) {
-      return err(`context failed: ${e?.message ?? e}`, 500);
+      return err(`context failed: ${e?.message ?? e}`, 500, {}, e);
     }
   });
 
@@ -274,7 +298,7 @@ export function apply(ctx, config = {}) {
       }
       return json({ ok: true, contentRevision: contentRevision(events), count: summaries.length, summaries });
     } catch (e) {
-      return err(`summary failed: ${e?.message ?? e}`, 500);
+      return err(`summary failed: ${e?.message ?? e}`, 500, {}, e);
     }
   });
 
@@ -296,7 +320,7 @@ export function apply(ctx, config = {}) {
       }));
       return json({ ok: true, total: events.length, offset, limit, events: window, header: { id: header.id, cwd: header.cwd } });
     } catch (e) {
-      return err(`history failed: ${e?.message ?? e}`, 500);
+      return err(`history failed: ${e?.message ?? e}`, 500, {}, e);
     }
   });
 

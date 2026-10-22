@@ -18,17 +18,17 @@ function replaceOnce(text, before, after) {
   return text.replace(before, after);
 }
 
-export function planAdapter(app, restore = false) {
+export function planAdapter(app, restore = false, { readFile = readFileSync, exists = existsSync, resolveFile = resolveHostFile } = {}) {
   const backup = join(app, ".session-editor-adapter");
   const manifestPath = join(backup, "manifest.json");
-  const previous = existsSync(manifestPath) ? JSON.parse(readFileSync(manifestPath, "utf8")) : [];
+  const previous = exists(manifestPath) ? JSON.parse(readFile(manifestPath, "utf8")) : [];
   if (!Array.isArray(previous) || previous.some(entry => !/^[a-f0-9]{64}$/.test(entry.original) || !/^[a-f0-9]{64}$/.test(entry.patched))) throw new Error('宿主适配备份清单无效');
   if (restore && previous.length) {
     const changes = previous.map((m) => {
-      const file = resolveHostFile(app, m.path);
-      const current = readFileSync(file, "utf8");
+      const file = resolveFile(app, m.path);
+      const current = readFile(file, "utf8");
       if (hash(current) !== m.patched && hash(current) !== m.original) throw new Error(`宿主已有其他修改，拒绝覆盖: ${m.path}`);
-      const after = readFileSync(join(backup, m.original), "utf8");
+      const after = readFile(join(backup, m.original), "utf8");
       if (hash(after) !== m.original) throw new Error(`宿主原件备份校验失败: ${m.path}`);
       return { file, path: m.path, before: current, after };
     });
@@ -52,11 +52,11 @@ export function planAdapter(app, restore = false) {
   ];
   const changes = specs.map((spec) => {
     const path = `node_modules/@deepseek-ai/${spec.pkg}/lib/${spec.file ?? "index.js"}`;
-    const file = resolveHostFile(app, path);
-    const before = readFileSync(file, "utf8");
+    const file = resolveFile(app, path);
+    const before = readFile(file, "utf8");
     const old = previous.find((m) => m.path === path);
     if (old && hash(before) !== old.original && hash(before) !== old.patched) throw new Error(`宿主已有其他修改，拒绝覆盖: ${path}`);
-    const originalText = old ? readFileSync(join(backup, old.original), "utf8") : before;
+    const originalText = old ? readFile(join(backup, old.original), "utf8") : before;
     if (old && hash(originalText) !== old.original) throw new Error(`宿主原件备份校验失败: ${path}`);
     if (!spec.original.includes(hash(originalText))) throw new Error(`尚未支持此 DSH 构建: ${spec.pkg}。未修改任何文件。`);
     return { file, path, before, originalText, after: spec.patch(originalText), original: hash(originalText) };

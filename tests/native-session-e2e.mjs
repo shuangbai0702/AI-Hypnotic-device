@@ -5,7 +5,7 @@ import fs from 'node:fs';
 import { join, resolve } from 'node:path';
 import { createRequire } from 'node:module';
 import { createServer } from 'node:http';
-import { spawn } from 'node:child_process';
+import { spawn, fork } from 'node:child_process';
 import { once } from 'node:events';
 import { randomUUID } from 'node:crypto';
 import { pathToFileURL } from 'node:url';
@@ -16,27 +16,36 @@ assert.ok(process.env.EDITOR_TEST_APP && process.env.EDITOR_TEST_HOME);
 const app = resolve(process.env.EDITOR_TEST_APP), home = resolve(process.env.EDITOR_TEST_HOME);
 const port = Number(process.env.EDITOR_TEST_PORT);
 assert.ok(port >= 1024 && port <= 65535 && ![3080, 3099].includes(port));
+const defaultHome = process.env.EDITOR_TEST_DEFAULT_HOME === 'yes';
+const desktopRuntime = process.env.EDITOR_TEST_DESKTOP_RUNTIME;
+if (desktopRuntime) assert.ok(process.versions.electron, 'desktop acceptance uses the selected Electron runtime');
+if (defaultHome) assert.equal(home, join(resolve(process.env.EDITOR_TEST_USER_HOME), '.dsh'), 'default-home test must own its fake user home');
 const requireHost = createRequire(join(app, 'package.json')), yaml = requireHost('js-yaml');
 const { Session } = await import(pathToFileURL(requireHost.resolve('@deepseek-ai/dsh-session')));
 const { assertReleasedV4Relationships } = await import(pathToFileURL(requireHost.resolve('@deepseek-ai/dsh-session-format-v3-to-v4')));
-const config = join(home, 'profiles/web/cordis.patch.yml'), original = fs.readFileSync(config);
+const config = join(home, 'profiles', desktopRuntime ? 'desktop' : 'web', 'cordis.patch.yml'), original = fs.readFileSync(config);
 const captures = []; let modelFailure, service, serviceOutput = '', cookie, id;
+let assistantRemoval, assistantToolSent = false;
 const mock = createServer(async (request, response) => {
   try {
     let body = ''; for await (const chunk of request) body += chunk;
     const payload = JSON.parse(body); captures.push(payload);
     assert.ok(Array.isArray(payload.messages));
-    const answer = captures.length === 1 ? 'QA_OLD_ASSISTANT_ANSWER' : 'QA_FOLLOWUP_' + captures.length;
+    const helper = payload.tools?.some(tool => tool.function?.name === 'remove_from_context');
+    const invokeRemoval = helper && !assistantToolSent;
+    if (invokeRemoval) { assert.ok(assistantRemoval); assistantToolSent = true; }
+    const answer = helper ? 'QA_ASSISTANT_REMOVAL_COMPLETE' : captures.length === 1 ? 'QA_OLD_ASSISTANT_ANSWER' : 'QA_FOLLOWUP_' + captures.length;
     response.writeHead(200, { 'content-type': 'text/event-stream' });
     const base = { id: 'local-qa', object: 'chat.completion.chunk', model: 'qa', created: 1 };
-    for (const [delta, finish_reason] of [[{ role: 'assistant', content: answer }, null], [{}, 'stop']]) {
-      response.write('data: ' + JSON.stringify({ ...base, choices: [{ index: 0, delta, finish_reason }] }) + '\n\n');
+    const delta = invokeRemoval ? { role:'assistant', tool_calls:[{index:0,id:'qa-removal-call',type:'function',function:{name:'remove_from_context',arguments:JSON.stringify(assistantRemoval)}}] } : { role:'assistant',content:answer };
+    for (const [part, finish_reason] of [[delta, null], [{}, invokeRemoval ? 'tool_calls' : 'stop']]) {
+      response.write('data: ' + JSON.stringify({ ...base, choices: [{ index: 0, delta:part, finish_reason }] }) + '\n\n');
     }
     response.end('data: [DONE]\n\n');
   } catch (error) { modelFailure = error; response.writeHead(500); response.end('local test failure'); }
 });
 await new Promise((done, reject) => { mock.once('error', reject); mock.listen(0, '127.0.0.1', done); });
-const origin = `http://127.0.0.1:${port}`;
+let origin = `http://127.0.0.1:${port}`;
 const pause = () => new Promise(done => setTimeout(done, 100));
 async function waitFor(check, label) {
   for (let attempt = 0; attempt < 300; attempt++) {
@@ -50,19 +59,45 @@ async function waitFor(check, label) {
 async function stop() {
   if (!service) return;
   const owned = service; service = undefined;
-  if (owned.exitCode === null) { const ended = once(owned, 'exit'); owned.kill(); await ended; }
+  if (owned.exitCode === null) {
+    const ended = once(owned, 'exit');
+    if (desktopRuntime && owned.connected) {
+      owned.send({ type: 'shutdown' }, () => {});
+      let timer; await Promise.race([ended, new Promise(done => { timer = setTimeout(done, 5000); })]); clearTimeout(timer);
+    }
+    if (owned.exitCode === null) { owned.kill(); await ended; }
+  }
 }
 async function start() {
   serviceOutput = '';
-  service = spawn(process.execPath, [join(app, 'lib/bin.js'), 'web', '--port', String(port), '--no-open'], {
-    env: { ...process.env, DSH_HOME: home, QA_LOCAL_API_KEY: 'local-model-only' }, cwd: home, windowsHide: true,
+  let desktopReadyUrl;
+  const env = { ...process.env, DSH_HOME: home, QA_LOCAL_API_KEY: 'local-model-only' };
+  if (defaultHome) {
+    delete env.DSH_HOME;
+    env.USERPROFILE = resolve(process.env.EDITOR_TEST_USER_HOME); env.HOME = env.USERPROFILE;
+    const { spawnSync } = await import('node:child_process');
+    const probe = spawnSync(process.execPath, ['-e', 'process.stdout.write(require("node:os").homedir())'], { env, encoding: 'utf8' });
+    assert.equal(probe.status, 0); assert.equal(resolve(probe.stdout), env.USERPROFILE, 'native default home must stay isolated');
+  }
+  service = desktopRuntime ? fork(join(desktopRuntime, 'node_modules/@deepseek-ai/dsh-desktop-host/lib/index.js'), [desktopRuntime, join(home, 'profiles/desktop'), process.env.EDITOR_TEST_PRIMARY_RUNTIME], {
+    execPath: process.execPath, execArgv: ['--expose-internals'], env: { ...env, ELECTRON_RUN_AS_NODE: '1' }, cwd: home, windowsHide: true,
+    stdio: ['ignore', 'pipe', 'pipe', 'ipc'],
+  }) : spawn(process.execPath, [join(app, 'lib/bin.js'), 'web', '--port', String(port), '--no-open'], {
+    env, cwd: home, windowsHide: true,
     stdio: ['ignore', 'pipe', 'pipe']
   });
   service.stdout.on('data', chunk => { serviceOutput += chunk; });
   service.stderr.on('data', () => {});
   service.on('error', error => { modelFailure = error; });
-  await waitFor(() => /\?token=([^\s\x1b]+)/.test(serviceOutput), 'launch token');
-  const token = serviceOutput.match(/\?token=([^\s\x1b]+)/)[1];
+  if (desktopRuntime) service.on('message', message => {
+    if (message?.type === 'fatal') modelFailure = Error('Desktop Host startup failed');
+    if (message?.type === 'ready') {
+      const url = new URL(message.url); assert.equal(url.hostname, '127.0.0.1'); assert.equal(url.protocol, 'http:');
+      assert.ok(![3080, 3099].includes(Number(url.port))); origin = url.origin; desktopReadyUrl = url;
+    }
+  });
+  await waitFor(() => desktopRuntime ? desktopReadyUrl : /\?token=([^\s\x1b]+)/.test(serviceOutput), 'launch token');
+  const token = desktopRuntime ? desktopReadyUrl.searchParams.get('token') : serviceOutput.match(/\?token=([^\s\x1b]+)/)[1];
   const auth = await fetch(origin + '/?token=' + encodeURIComponent(token), { redirect: 'manual' });
   cookie = auth.headers.get('set-cookie')?.split(';')[0]; assert.ok(cookie, 'authenticated cookie');
   const page = await fetch(origin, { headers: { cookie } }); assert.equal(page.status, 200);
@@ -169,14 +204,33 @@ try {
     validateStoredSession();
   }
   await stop(); await start(); await prompt('Continue after edit and service restart');
+  view = await context(); const removedByAssistant=view.messages.find(m=>m.role==='assistant');assert.ok(removedByAssistant);
+  assistantRemoval={seq:removedByAssistant.seq,expectRevision:view.contentRevision};
+  await api('/assistant/open',{});await api('/assistant/prompt',{text:'Run the synthetic removal check.'});
+  await waitFor(async()=>{
+    const state=await api('/assistant/status?id='+id), result=state.results.find(r=>r.name==='remove_from_context');
+    if(result)assert.equal(result.ok,true,JSON.stringify(result));
+    return result?.ok&&state.status==='idle';
+  },'assistant tool removal completes without self-disposal deadlock');
+  await api('/assistant/close',{});
+  await prompt('Continue after assistant removal');
+  assert.ok(!JSON.stringify(captures.at(-1).messages).includes(removedByAssistant.text));
   const concurrent = await Promise.all(Array.from({ length: 8 }, () => context()));
   assert.ok(concurrent.every(value => value.contentRevision === concurrent[0].contentRevision));
   assert.ok(concurrent.every(value => JSON.stringify(value.messages) === JSON.stringify(concurrent[0].messages)));
   validateStoredSession();
-  console.log(JSON.stringify({ ok: true, nativeWebSession: true, modelRequests: captures.length,
+  await api('/diagnostics/client-error',{operation:'conversation-sync',error:{name:'Error',stack:'Error PRIVATE_BROWSER_ERROR\n    at sync (D:/private-directory/client.js:12:3)'}});
+  const diagnostics = await api('/diagnostics/export');
+  assert.equal(diagnostics.runtime.dsh, JSON.parse(fs.readFileSync(join(app,'package.json'),'utf8')).version);
+  assert.equal(diagnostics.logging.homeSource, 'persistence');assert.equal(diagnostics.logging.writeFailure, null);
+  assert.ok(diagnostics.records.some(e=>e.route==='/api/session-editor/workbench/apply'));
+  assert.ok(diagnostics.records.some(e=>e.event==='client.error'&&e.operation==='conversation-sync'));
+  for (const marker of ['QA_FIRST_USER_ORIGINAL','QA_EDITED_ASSISTANT_ANSWER','local-model-only','PRIVATE_BROWSER_ERROR','private-directory',home,cookie]) assert.ok(!JSON.stringify(diagnostics).includes(marker), 'diagnostic export excludes private input');
+  console.log(JSON.stringify({ ok: true, nativeWebSession: !desktopRuntime, nativeDesktopHost: !!desktopRuntime, modelRequests: captures.length,
+    defaultHomeWithoutEnvironment: defaultHome, diagnosticExport: true,
     summaryEdited: true, retainedAssistantEdited: true, archivedOriginalReadOnly: true,
     secondCompactionAndRestart: true, repeatedRemovalAndNativeHistory: true, continueAfterEachRemoval: true,
-    insertRolesAndContinue: true, continueAfterServiceRestart: true, concurrentReads: 8, nativeValidation: true }));
+    insertRolesAndContinue: true, continueAfterServiceRestart: true, assistantToolRemovalAndContinue: true, concurrentReads: 8, nativeValidation: true }));
 } finally {
   await stop(); fs.writeFileSync(config, original);
   mock.closeAllConnections(); await new Promise(done => mock.close(done));

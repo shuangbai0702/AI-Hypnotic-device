@@ -1,7 +1,7 @@
 ﻿# Discovery is read-only. Never start/stop DSH or install packages while probing.
 function Test-DshDirectory([string]$Directory) {
     if (-not $Directory) { return $false }
-    try { return (Test-Path -LiteralPath (Join-Path $Directory 'lib/bin.js')) -and ((Get-Content -LiteralPath (Join-Path $Directory 'package.json') -Raw | ConvertFrom-Json).name -eq '@deepseek-ai/dsh') } catch { return $false }
+    try { return ((Test-Path -LiteralPath (Join-Path $Directory 'lib/bin.js')) -and ((Get-Content -LiteralPath (Join-Path $Directory 'package.json') -Raw | ConvertFrom-Json).name -eq '@deepseek-ai/dsh')) -or ((Test-Path -LiteralPath (Join-Path $Directory 'resources/app.asar')) -and (Test-Path -LiteralPath (Join-Path $Directory 'DeepSeek Harness.exe'))) } catch { return $false }
 }
 function Get-NodeProcesses {
     return @(Get-CimInstance Win32_Process -Filter "Name='node.exe'" -ErrorAction SilentlyContinue)
@@ -49,6 +49,9 @@ function Find-DshCandidates([int]$PreferredPort=3080,[int]$Attempts=3) {
             }
         }
         if ($env:DSH_APP) { $paths.Add(@{path=$env:DSH_APP;source='DSH_APP';port=$PreferredPort}) }
+        foreach($base in @($env:LOCALAPPDATA,$env:ProgramFiles,${env:ProgramFiles(x86)})) {
+            if($base){foreach($folder in @('DeepSeek Harness','Programs/DeepSeek Harness','DSH','Programs/DSH')){$paths.Add(@{path=(Join-Path $base $folder);source='桌面安装目录';port=0})}}
+        }
         $prefixes=@()
         foreach ($command in @(Get-Command dsh,dsh.cmd,npm,npm.cmd -All -ErrorAction SilentlyContinue)) { if($command.Source){$prefixes+=Split-Path -Parent $command.Source} }
         if ($env:APPDATA) { $prefixes+=Join-Path $env:APPDATA 'npm' }
@@ -68,7 +71,8 @@ function Find-DshCandidates([int]$PreferredPort=3080,[int]$Attempts=3) {
             if (-not (Test-DshDirectory $entry.path)) { continue }
             $full=[IO.Path]::GetFullPath($entry.path).TrimEnd('\')
             if($seen.ContainsKey($full.ToLowerInvariant())){continue}; $seen[$full.ToLowerInvariant()]=$true
-            $meta=Get-Content -LiteralPath (Join-Path $full 'package.json') -Raw | ConvertFrom-Json
+            $isDesktop=Test-Path -LiteralPath (Join-Path $full 'resources/app.asar')
+            $meta=if($isDesktop){@{version=(Get-Item -LiteralPath (Join-Path $full 'DeepSeek Harness.exe')).VersionInfo.ProductVersion}}else{Get-Content -LiteralPath (Join-Path $full 'package.json') -Raw | ConvertFrom-Json}
             $detectedHome=if($env:DSH_HOME){$env:DSH_HOME}else{Join-Path $env:USERPROFILE '.dsh'}
             $adjacent=Join-Path (Split-Path -Parent $full) 'home'
             if(-not $env:DSH_HOME -and (Test-Path -LiteralPath (Join-Path $adjacent 'profiles/web/package.json'))){$detectedHome=$adjacent}
@@ -78,10 +82,10 @@ function Find-DshCandidates([int]$PreferredPort=3080,[int]$Attempts=3) {
             if(Test-Path -LiteralPath $ownerPath){
                 try{
                     $owner=Get-Content -LiteralPath $ownerPath -Raw | ConvertFrom-Json
-                    if($owner.active -and $owner.home -and (Test-Path -LiteralPath (Join-Path $owner.home 'profiles/web/package.json'))){$detectedHome=$owner.home}
+                    if($owner.active -and $owner.home){$detectedHome=$owner.home}
                 }catch{}
             }
-            $found+=@{app=$full;home=$detectedHome;version=$meta.version;source=$entry.source;port=$entry.port;node=$(if($entry.process){$entry.process.ExecutablePath}else{''});label=("DSH "+$meta.version+' · '+$entry.source+' · '+$full)}
+            $found+=@{app=$full;home=$detectedHome;version=$meta.version;source=$entry.source;port=$(if($isDesktop){$PreferredPort}else{$entry.port});profile=$(if($isDesktop){'desktop'}else{'web'});node=$(if($entry.process){$entry.process.ExecutablePath}else{''});label=("DSH "+$meta.version+' · '+$entry.source+' · '+$full)}
         }
         if($found.Count){return $found}
         if($attempt+1 -lt $Attempts){Start-Sleep -Milliseconds (200*($attempt+1))}
@@ -104,9 +108,14 @@ function Test-NodeRuntime([string]$Path) {
     } catch { return $null } finally { if($process){$process.Dispose()} }
 }
 function Find-NodeRuntime([string]$App,[string]$PreferredNode,[int]$Attempts=2) {
+    # Fast paths avoid unrelated process discovery when the selected runtime
+    # or the desktop's own Node already satisfies the capability contract.
+    foreach($direct in @($PreferredNode,$(if($App){Join-Path $App 'resources/runtime/primary-runtime/dependencies/node/bin/node.exe'}))) {
+        $runtime=Test-NodeRuntime $direct;if($runtime){return $runtime}
+    }
     $candidates=@($PreferredNode)
     foreach($process in @(Get-NodeProcesses)) {if((Get-ProcessDshApp $process) -eq $App){$candidates+=$process.ExecutablePath}}
-    if($App){foreach($relative in @('node.exe','bin/node.exe','runtime/node.exe','node/node.exe','../../node.exe','../../../node.exe','../../../../node.exe')){$candidates+=Join-Path $App $relative}}
+    if($App){foreach($relative in @('resources/runtime/primary-runtime/dependencies/node/bin/node.exe','node.exe','bin/node.exe','runtime/node.exe','node/node.exe','../../node.exe','../../../node.exe','../../../../node.exe')){$candidates+=Join-Path $App $relative}}
     foreach($command in @(Get-Command node.exe -All -ErrorAction SilentlyContinue)){if($command.Source){$candidates+=$command.Source}}
     foreach($directory in @(Get-CommonNodeDirectories)){$candidates+=Join-Path $directory 'node.exe'}
     if($env:LOCALAPPDATA){$cache=Join-Path $env:LOCALAPPDATA 'AI-Hypnotic-device/runtimes';if(Test-Path -LiteralPath $cache){foreach($dir in @(Get-ChildItem -LiteralPath $cache -Directory -ErrorAction SilentlyContinue)){$candidates+=Join-Path $dir.FullName 'node.exe'}}}

@@ -3,10 +3,15 @@ import assert from "node:assert/strict";
 import { createMemoryAssistant, registerMemoryAssistant, selectedModel } from "../plugins/dsh-session-editor/lib/memory-assistant.js";
 import { contentRevision, rewriteMessage } from "../plugins/dsh-session-editor/lib/physical-edit.js";
 import { assertObjectJsonSchema, validateJsonSchemaValue } from "../app/node_modules/@deepseek-ai/dsh-tools/lib/index.js";
+import { mkdtempSync } from 'node:fs';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
+import { getDiagnostics } from '../plugins/dsh-session-editor/lib/diagnostics.js';
 
 const deferred = () => { let resolve; const promise = new Promise(r => { resolve = r; }); return { promise, resolve }; };
 const response = (v, status = 200) => new Response(JSON.stringify(v), { status });
 function fixture() {
+  const home = mkdtempSync(join(tmpdir(), 'memory-assistant-test-'));
   const blocks = [{ type: "reasoning", text: "thought one" }, { type: "text", text: "old body" }, { type: "image", url: "attachment://image" },
     { type: "thinking", thinking: "thought two" }, { type: "text", text: "second paragraph" }, { type: "tool-call", id: "call", name: "test", arguments: "{}" }];
   let events = [{ seq: 0, type: "assistant/message", data: { message: { role: "assistant", content: blocks } } },
@@ -18,6 +23,7 @@ function fixture() {
   const ctx = {
     agentDefaultModel: { currentSelection: () => ({ provider: "configured", model: "default", reasoningEffort: "high" }) },
     sessionPersistence: {
+      root: join(home, 'sessions'),
       stat: async id => persisted.has(id) ? { header: persisted.get(id) } : undefined,
       list: async () => [...persisted.values()].map(header => ({ header })),
       open: async (id, access) => { assert.ok(id === 'target' || id.startsWith('session-editor-memory-')); assert.equal(access, "read"); return { read: async (offset, limit) => ({ events: id === 'target' ? events.slice(offset, offset + limit) : [] }), close: async () => { stats.closedReads++; } }; },
@@ -318,5 +324,28 @@ test('AI candidate tool never applies and rejects protected endpoints and stale 
   assert.equal((await f.invoke('propose_memory', { kind: 'message', seq: 999, text: 'bad', reason: 'test', expectRevision: before })).ok, false);
   assert.equal((await f.invoke('propose_memory', { kind: 'message', seq: 0, text: 'bad', reason: 'test', expectRevision: 'old' })).ok, false);
   assert.equal(f.stats.writes, 0);
+  await f.assistant.dispose();
+});
+
+test('assistant failures return persistent diagnostic IDs without recording text or tool arguments',async()=>{
+  const f=fixture();await f.assistant.open('target');
+  const marker='PRIVATE_TOOL_BODY_SENTINEL';
+  const result=await f.invoke('edit_message',{seq:0,text:marker,expectRevision:'stale'});
+  assert.equal(result.ok,false);assert.ok(result.diagnosticId);
+  const report=getDiagnostics(f.ctx).export();
+  assert.ok(report.records.some(e=>e.id===result.diagnosticId&&e.event==='assistant.tool.error'));
+  assert.ok(report.records.some(e=>e.event==='assistant.tool'&&e.diagnosticId===result.diagnosticId));
+  assert.equal(JSON.stringify(report).includes(marker),false);
+  assert.equal(JSON.stringify(report).includes('target'),false);
+  await f.assistant.dispose();
+});
+
+test('assistant removal delegates to the detached-write gate without maintaining the agent it releases',async()=>{
+  const f=fixture();await f.assistant.open('target');
+  f.live.set('target',{status:'idle',session:{snapshotEvents:f.events},runMaintenance:()=>{throw Error('cannot release an agent from inside its own maintenance');}});
+  const result=await f.invoke('remove_from_context',{seq:0,expectRevision:f.revision()});
+  assert.equal(result.ok,true,JSON.stringify(result));
+  assert.equal(f.requests.some(r=>r.path==='attach'),false);
+  assert.equal(f.requests.filter(r=>r.path==='delete-node').length,1);
   await f.assistant.dispose();
 });

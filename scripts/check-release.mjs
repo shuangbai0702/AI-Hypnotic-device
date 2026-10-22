@@ -4,11 +4,11 @@ const allowed = [
   /^(?:\.gitignore|README\.md|package\.json)$/,
   /^docs\/(?:GITHUB-PUBLISH-PLAN|VALIDATION|RELIABILITY-PLAN|RELIABILITY-VALIDATION)\.md$/,
   /^scripts\/check-release\.mjs$/,
-  /^packaging\/windows\/(?:Build\.ps1|Installer\.ps1|Discovery\.ps1|Launcher\.cs|README\.md)$/,
+  /^packaging\/windows\/(?:Build\.ps1|Installer\.ps1|Discovery\.ps1|Desktop\.ps1|Launcher\.cs|README\.md)$/,
   /^plugins\/dsh-session-editor\/(?:package\.json|README\.md|AGENT\.md|install\.mjs|host-adapter\.mjs)$/,
   /^plugins\/dsh-session-editor\/lib\/[a-z-]+\.(?:js|mjs)$/,
-  /^tests\/(?:memory-workbench|workbench-client|memory-assistant|context-coverage|session-editor-regression|assistant-edit-wire|memory-ergonomics-client|native-chat-projection|storage-integrity|installer-transaction|native-session-e2e)\.mjs$/,
-  /^tests\/windows-(?:installation-e2e|discovery|health-rollback)\.ps1$/,
+  /^tests\/(?:memory-workbench|workbench-client|memory-assistant|context-coverage|session-editor-regression|assistant-edit-wire|memory-ergonomics-client|native-chat-projection|storage-integrity|runtime-diagnostics|installer-transaction|desktop-installation|native-session-e2e)\.mjs$/,
+  /^tests\/windows-(?:installation-e2e|desktop-e2e|discovery|health-rollback)\.ps1$/,
 ];
 const patterns = [
   ['personal Windows path', /[A-Z]:[\\/](?:Users|MYCODE)[\\/]/i],

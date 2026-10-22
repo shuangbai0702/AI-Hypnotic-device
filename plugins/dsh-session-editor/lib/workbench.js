@@ -5,6 +5,8 @@ import { join } from "node:path";
 import { contentRevision, physicalEdit, summaryBody } from "./physical-edit.js";
 import { acquireLiveSession, detachSession, json, err, withSessionWrite } from "./edit.js";
 import { isCompactionCheckpoint, memoryAccess, contextCoverage } from "./coverage.js";
+import { runtimePaths } from './runtime-paths.js';
+import { getDiagnostics } from './diagnostics.js';
 
 const fail = (text, status = 400) => Object.assign(new Error(text), { status });
 const check = signal => signal?.throwIfAborted();
@@ -87,7 +89,7 @@ export function compressionRanges(snapshot) {
 
 export function createWorkbench(ctx, computeSurface) {
   const pending = new Set();
-  const root = () => { if (!process.env.DSH_HOME) throw fail("DSH_HOME 未配置", 500); return join(process.env.DSH_HOME, "session-editor", "candidates"); };
+  const root = () => join(runtimePaths(ctx).home, 'session-editor', 'candidates');
   const file = id => join(root(), digest(safeId(id)) + ".json");
   function load(id) {
     const path = file(id);
@@ -241,18 +243,26 @@ export function createWorkbench(ctx, computeSurface) {
       if (candidate.status !== "pending") throw fail("此候选已经拒绝", 409);
       if (ctx.agents.get(id)?.status === "running") throw fail("目标会话正在生成，请停止后应用", 409);
       const v = await snapshot(id);
+      const applied = (revision, result) => {
+        candidate.status = "applied"; candidate.appliedAt ??= Date.now(); candidate.appliedRevision = revision;
+        let warning, diagnosticId;
+        try { save(id, items); } catch (error) {
+          warning = "内容已写入；候选状态保存失败，重试将核对提交记录。";
+          diagnosticId = getDiagnostics(ctx).warning('candidate-state-save', error, id);
+        }
+        return { ok: true, ...result, contentRevision: revision, candidateId, warning, diagnosticId };
+      };
       // An append may have committed even if persisting the candidate status failed.
       const receipt = v.events.find(e => messageOf(e)?.id === candidateId || messageOf(e)?.source?.compactionId === candidateId ||
         (candidate.kind.startsWith("tool-") && e.type === "tool/result" && e.sourceEventSeqs?.includes(candidate.seq) && JSON.stringify(messageOf(e)?.content) === JSON.stringify(candidate.replacement.blocks)));
       if (receipt) {
-        candidate.status = "applied"; candidate.appliedRevision = v.revision; save(id, items);
-        return { ok: true, alreadyApplied: true, contentRevision: v.revision };
+        return applied(v.revision, { alreadyApplied: true });
       }
       if (["message", "summary", "field-restore", "tool-trim", "tool-restore"].includes(candidate.kind)) {
         const e = v.events.find(e => e.seq === candidate.seq);
         const same = candidate.replacement.blocks ? JSON.stringify(messageOf(e)?.content) === JSON.stringify(candidate.replacement.blocks)
           : isCompactionCheckpoint(e) && summaryBody(bodyOf(messageOf(e))) === summaryBody(candidate.replacement.text);
-        if (same) { candidate.status = "applied"; candidate.appliedRevision = v.revision; save(id, items); return { ok: true, alreadyApplied: true, contentRevision: v.revision }; }
+        if (same) return applied(v.revision, { alreadyApplied: true });
       }
       validateCandidate(v, candidate);
       let result;
@@ -262,10 +272,7 @@ export function createWorkbench(ctx, computeSurface) {
           ...(candidate.kind.startsWith("tool-") ? { toolBlocks: candidate.replacement.blocks } : candidate.replacement.text !== undefined ? { summaryText: candidate.replacement.text } : { blocks: candidate.replacement.blocks }) }, detachSession);
       } else result = await commitAppend(id, candidate, signal);
       // A completed business write remains completed even if the viewer disconnects.
-      candidate.status = "applied"; candidate.appliedAt = Date.now(); candidate.appliedRevision = result.contentRevision;
-      let warning;
-      try { save(id, items); } catch { warning = "内容已写入；候选状态保存失败，重试将核对提交记录。"; }
-      return { ok: true, ...result, candidateId, warning };
+      return applied(result.contentRevision, result);
     }));
   }
   async function commitAppend(id, c, signal) {
@@ -353,7 +360,7 @@ export function createWorkbench(ctx, computeSurface) {
 
 export function registerWorkbench(ctx, route, computeSurface) {
   const service = createWorkbench(ctx, computeSurface);
-  const wrap = run => async request => { try { return json(await run(request)); } catch (error) { return err(String(error?.message ?? error), error.status ?? 500); } };
+  const wrap = run => async request => { try { return json(await run(request)); } catch (error) { return err(String(error?.message ?? error), error.status ?? 500, {}, error); } };
   route("/api/session-editor/workbench", ["GET"], wrap(r => service.list(new URL(r.url).searchParams.get("id"))));
   route("/api/session-editor/workbench/originals", ["GET"], wrap(r => { const p = new URL(r.url).searchParams; return service.originals(p.get("id"), p.get("query") ?? "", p.has("seq") ? Number(p.get("seq")) : undefined, Number(p.get("offset") ?? 0), p.get("archiveId") ?? undefined); }));
   for (const action of ["propose", "apply", "reject"]) route(`/api/session-editor/workbench/${action}`, ["POST"], wrap(async r => {

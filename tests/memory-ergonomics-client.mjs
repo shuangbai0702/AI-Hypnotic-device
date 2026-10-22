@@ -7,6 +7,45 @@ const deferred=()=>{let resolve;const promise=new Promise(r=>resolve=r);return {
 const h=(type,props,...children)=>({type,props:props??{},children:children.flat(Infinity).filter(c=>c!==null&&c!==undefined&&c!==false)});
 const walk=n=>n&&typeof n==='object'?[n,...n.children.flatMap(walk)]:[];
 const text=n=>typeof n==='object'?n.children.map(text).join(''):String(n??'');
+
+test('coverage refresh preserves row badges and rejects late results after switching sessions',async()=>{
+  const rows=[],calls=[],listeners=new Map(),timers=new Map();let nextTimer=0;
+  class Element {
+    constructor(){this.dataset={};this.children=[];this.style={};this.nodeType=1;this.isConnected=false;this.attrs=new Set();}
+    hasAttribute(key){return this.attrs.has(key);}
+    setAttribute(key){this.attrs.add(key);}
+    prepend(child){this.children.unshift(child);child.parent=this;child.isConnected=true;}
+    append(child){this.children.push(child);}
+    replaceChildren(...children){this.children=children;}
+    remove(){this.parent.children=this.parent.children.filter(c=>c!==this);this.isConnected=false;}
+    closest(selector){return selector==='[data-conversation-session]'?{dataset:{conversationSession:this.sessionId}}:null;}
+  }
+  const row=new Element();row.dataset.chatNodeKey='node';row.sessionId='a';rows.push(row);
+  const current={value:{key:'a'},subscribe:fn=>{current.notify=fn;return ()=>{};}};
+  const owners={a:{},b:{}};
+  const ctx={uiSession:{current},sessions:{binding:id=>owners[id]},uiConversation:{binding:()=>({target:()=>({
+    getSnapshot:()=>({nodes:new Map([['node',{kind:'user',data:{seq:8}}]])}),subscribe:()=>()=>{}
+  })})}};
+  const install=runInNewContext(source.slice(source.indexOf('    const coverageVisual ='),source.indexOf('    function reportClientFailure('))+';installChatCoverage',{
+    document:{querySelectorAll:()=>rows,createElement:()=>new Element(),createTextNode:text=>({text}),body:{}},
+    MutationObserver:class{observe(){}disconnect(){}},window:{addEventListener:(key,fn)=>listeners.set(key,fn),removeEventListener:key=>listeners.delete(key)},
+    AbortController,Map,Set,encodeURIComponent,setTimeout:fn=>{timers.set(++nextTimer,fn);return nextTimer;},clearTimeout:id=>timers.delete(id),
+    api:()=>new Promise((resolve,reject)=>calls.push({resolve,reject}))
+  });
+  const result={items:[{seq:8,coverageState:'retained',chain:[]}]},flush=()=>new Promise(r=>setImmediate(r));
+  const cleanup=install(ctx);calls[0].resolve(result);await flush();
+  const badge=row.children[0];assert.ok(badge);
+  const pending=listeners.get('session-editor:changed')();
+  assert.equal(row.children[0],badge,'in-flight refresh must not collapse row height');
+  calls[1].resolve(result);await pending;assert.equal(row.children[0],badge);
+  const failed=listeners.get('session-editor:changed')();calls[2].reject(new Error('offline'));await failed;
+  assert.equal(row.children[0],badge);assert.match(badge.title,/上次确认/);
+  const late=listeners.get('session-editor:changed')();
+  current.value.key='b';row.sessionId='b';current.notify();assert.equal(row.children.length,0);
+  calls[4].resolve({items:[]});await flush();calls[3].resolve(result);await late;
+  assert.equal(row.children.length,0,'old session result must not label the new session');
+  cleanup();assert.equal(listeners.size,0);assert.equal(timers.size,0);
+});
 function fixture(name,end,extra={}) {
   const state=[],refs=[],effects=[];let index=0,ri=0,ei=0;
   const context={h,useState:initial=>{const i=index++;if(!(i in state))state[i]=initial;return [state[i],v=>state[i]=typeof v==='function'?v(state[i]):v];},
@@ -50,6 +89,52 @@ test('tab navigation retains visited editor instances and uses four primary acti
   assert.ok(walk(second).find(n=>n.props.key==='target:workbench'));
   f.find(props,'有效上下文').props.onClick();
   assert.equal(walk(f.render(props)).find(n=>n.props.key==='target:context').props.hidden,false);
+});
+
+test('diagnostics download uses exported JSON and suppresses late download after leaving',async()=>{
+  for(const leave of [false,true]) {
+    const gate=deferred(),alive={current:true},report={schemaVersion:1,records:[{event:'http.request'}]};
+    let clicked=0,revoked=0,download,blob;
+    const dummy=()=>{},link={click:()=>clicked++,remove:()=>{}};
+    const f=fixture('EditorPanel','currentSessionId',{
+      ContextView:dummy,WorkbenchView:dummy,MemoryAssistant:dummy,CoverageView:dummy,SummaryView:dummy,HistoryView:dummy,
+      useLifetime:()=>alive,api:async path=>{assert.equal(path,'/diagnostics/export');await gate.promise;return report;},
+      Blob:class {constructor(parts){blob=parts.join('');}},URL:{createObjectURL:()=> 'blob:test',revokeObjectURL:()=>revoked++},
+      document:{createElement:()=>link,body:{appendChild:n=>{download=n;}}},setTimeout:fn=>fn()
+    });
+    const props={sessionId:'target'},pending=f.find(props,'导出脱敏诊断').props.onClick();
+    assert.equal(f.find(props,'正在导出…').props.disabled,true);
+    if(leave)alive.current=false;
+    gate.resolve();await pending;
+    assert.equal(clicked,leave?0:1);assert.equal(revoked,leave?0:1);
+    if(!leave){assert.equal(download.download,'session-editor-diagnostics.json');assert.deepEqual(JSON.parse(blob),report);}
+  }
+});
+
+test('API errors show the diagnostic request ID beside the actual failure',async()=>{
+  const api=runInNewContext(source.slice(source.indexOf('    async function api('),source.indexOf('    const post ='))+';api',{
+    API:'/api/session-editor',fetch:async()=>({ok:false,status:409,headers:new Headers(),json:async()=>({error:'版本冲突',requestId:'diagnostic-test-id'})})
+  });
+  await assert.rejects(api('/edit'),/版本冲突.*诊断编号：diagnostic-test-id/);
+});
+
+test('sync diagnostics omit arbitrary error messages and cannot replace the original failure',async()=>{
+  const calls=[],original=new Error('PRIVATE_SYNC_ERROR_SENTINEL');
+  const refresh=runInNewContext(source.slice(source.indexOf('    function reportClientFailure('),source.indexOf('    async function api('))+';refreshConversation',{
+    API:'/api/session-editor',hostSessions:{binding:()=>({session:{resync:async()=>{throw original;}}})},
+    fetch:(path,options)=>{calls.push({path,body:JSON.parse(options.body)});throw new Error('report also failed');}
+  });
+  await assert.rejects(refresh('target'),error=>error===original);
+  assert.equal(calls.length,1);assert.equal(calls[0].body.operation,'conversation-sync');
+  assert.equal(JSON.stringify(calls).includes('PRIVATE_SYNC_ERROR_SENTINEL'),false);
+});
+
+test('intentional API cancellation is not reported as a network fault',async()=>{
+  let reports=0;
+  const api=runInNewContext(source.slice(source.indexOf('    async function api('),source.indexOf('    const post ='))+';api',{
+    API:'/api/session-editor',fetch:async()=>{throw Object.assign(new Error('cancelled'),{name:'AbortError'});},reportClientFailure:()=>reports++
+  });
+  await assert.rejects(api('/coverage'),/cancelled/);assert.equal(reports,0);
 });
 
 test('message and summary saves retain the editor until native sync settles, then refresh only the live view',async()=>{

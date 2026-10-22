@@ -16,11 +16,13 @@ function fixture(config = '[]\n') {
   fs.cpSync(resolve('app/node_modules/js-yaml'), join(app, 'node_modules/js-yaml'), { recursive: true });
   const paths = installPaths(app, home); fs.mkdirSync(join(home, 'profiles/web'), { recursive: true }); fs.writeFileSync(paths.config, config);
   fs.writeFileSync(join(home, 'credentials.yaml'), 'synthetic-credential: must-stay-identical\n');
+  fs.writeFileSync(join(home, '.credentials.yaml'), 'synthetic-native-credential: must-stay-identical\n');
   const original = hostFiles.map(file => fs.readFileSync(join(app, file)));
   return { app, home, paths, root, original, assertRestored() {
     hostFiles.forEach((file, i) => assert.deepEqual(fs.readFileSync(join(app, file)), original[i]));
     assert.equal(fs.readFileSync(paths.config, 'utf8'), config);
     assert.equal(fs.readFileSync(join(home, 'credentials.yaml'), 'utf8'), 'synthetic-credential: must-stay-identical\n');
+    assert.equal(fs.readFileSync(join(home, '.credentials.yaml'), 'utf8'), 'synthetic-native-credential: must-stay-identical\n');
   }, close() { fs.rmSync(root, { recursive: true, force: true }); } };
 }
 test('stock [] and existing YAML round-trip, idempotent registration, invalid YAML refuses preflight', () => {
@@ -36,6 +38,21 @@ test('stock [] and existing YAML round-trip, idempotent registration, invalid YA
       assert.equal(fs.existsSync(f.paths.root), false);
     }
   } finally { f.close(); }
+});
+
+test('install, reinstall and uninstall preserve account, provider, endpoint and default model settings',()=>{
+  const entries=[{id:'llm-deepseek',config:{apiKeyEnv:'EXISTING_OFFICIAL_KEY',baseURL:'https://api.example.invalid/v1'}},
+    {id:'llm-pi-ai',config:{providers:{existing:{apiKeyEnv:'EXISTING_CUSTOM_KEY',baseURL:'https://proxy.example.invalid/v1',models:[{id:'keep-model'}]}}}},
+    {id:'agent-default-model',config:{provider:'existing',model:'keep-model'}}];
+  const f=fixture(yaml.dump(entries));try {
+    for(let n=0;n<2;n++) {
+      installTransaction(f.app,f.home,source);
+      const installed=yaml.load(fs.readFileSync(f.paths.config,'utf8'));
+      assert.deepEqual(installed.slice(0,-1),entries);assert.equal(installed.length,entries.length+1);
+      assert.equal(fs.readFileSync(join(f.home,'.credentials.yaml'),'utf8'),'synthetic-native-credential: must-stay-identical\n');
+    }
+    installTransaction(f.app,f.home,source,{uninstall:true});f.assertRestored();
+  }finally{f.close();}
 });
 for (const phase of ['prepared', ...Array.from({length: 7}, (_, index) => 'committed-' + index)]) test(`fault at ${phase} restores all host, plugin, config and credentials`, () => {
   const f = fixture(); try {
@@ -63,6 +80,7 @@ test('health failure rolls back; completion verifies bytes and preserves custom 
     assert.throws(() => preflight(f.app, f.home), /未完成/);
     recoverInstallation(f.app, f.home); f.assertRestored();
     installTransaction(f.app, f.home, source);
+    assert.deepEqual(JSON.parse(fs.readFileSync(join(f.paths.target,'host.json'),'utf8')), {app:f.app,home:f.home});
     const prompt = join(f.paths.target, 'AGENT.md'); fs.writeFileSync(prompt, 'synthetic custom prompt');
     installTransaction(f.app, f.home, source); assert.equal(fs.readFileSync(prompt, 'utf8'), 'synthetic custom prompt');
     installTransaction(f.app, f.home, source, { uninstall: true }); f.assertRestored();

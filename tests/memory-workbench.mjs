@@ -1,6 +1,6 @@
 import test from "node:test";
 import assert from "node:assert/strict";
-import { mkdtempSync, mkdirSync, writeFileSync } from "node:fs";
+import { mkdtempSync, mkdirSync, writeFileSync, existsSync } from "node:fs";
 import { join } from "node:path";
 import { tmpdir } from "node:os";
 import { Session, foldSurface } from "../app/node_modules/@deepseek-ai/dsh-session/lib/index.js";
@@ -27,13 +27,45 @@ function fixture(rows = [user(0, "original fact ".repeat(300)), user(1, "other f
   const dir = join(home, "sessions", "workspace", id); mkdirSync(dir, { recursive: true });
   const persist = () => writeFileSync(join(dir, "session.v4.jsonl.zstd"), [{ type: "session", ...header }, ...session.snapshotEvents()].map(JSON.stringify).join("\n") + "\n"); persist();
   const agent = { get status() { return running ? "running" : "idle"; }, get session() { return session; }, runMaintenance: async fn => { if (running) throw Error("busy"); return fn(new AbortController().signal); } };
-  const ctx = { get: () => ({}), agents: { get: () => agent, releaseIdle: async () => { live = false; } }, sessionPersistence: { open: async () => ({ header, inheritedEventCount: 0, close: async () => {} }) }, sessions: { get: () => live ? session : undefined,
+  const ctx = { get: () => ({}), agents: { get: () => agent, releaseIdle: async () => { live = false; } }, sessionPersistence: { root: join(home, 'sessions'), open: async () => ({ header, inheritedEventCount: 0, close: async () => {} }) }, sessions: { get: () => live ? session : undefined,
     prepare: (id, opts) => { if (live) throw Error("session already exists: real store rejects preparing a live id"); return Session.create(id, opts.seed, opts.meta); }, flush: async () => { flushes++; persist(); } } };
   const compute = async () => { if (!live) { const { loadSession } = await import("../plugins/dsh-session-editor/lib/shadowing.js"); session = Session.create(id, loadSession(dir).events.slice(1), header); } const events = session.snapshotEvents(); return { events, fold: foldSurface(events), bySeq: new Map(events.map(e => [e.seq, e])) }; };
   return { id, home, header, ctx, service: createWorkbench(ctx, compute), get session() { return session; }, revision: () => contentRevision(session.snapshotEvents()), running: v => running = v,
     replace: events => { session = Session.create(id, events, header); persist(); }, validate: () => assertReleasedV4Relationships({ header, events: session.snapshotEvents(), inheritedEventCount: 0 }, new Set(session.snapshotEvents().map(e => e.type))),
     close: () => { if (previous === undefined) delete process.env.DSH_HOME; else process.env.DSH_HOME = previous; } };
 }
+
+test('no DSH_HOME: candidates, physical message edits and backups follow native persistence root', async () => {
+  const f=fixture();
+  try {
+    delete process.env.DSH_HOME;
+    const proposed=await f.service.propose(f.id,{kind:'message',seq:0,text:'edited without env',expectRevision:f.revision()});
+    await f.service.apply(f.id,proposed.candidate.candidateId);
+    await f.service.list(f.id); // Reload the released session from its rewritten log.
+    assert.equal(f.session.deriveMessages()[0].content[0].text,'edited without env');
+    assert.ok(existsSync(join(f.home,'session-editor','candidates')));
+    assert.ok(existsSync(join(f.home,'backups','physical-sync')));
+    f.validate();
+  } finally { f.close(); }
+});
+
+for(const kind of ['compress','message'])test(`committed ${kind} stays successful when candidate status cannot be saved, including retry`,async()=>{
+  const f=fixture();try {
+    const {createHash}=await import('node:crypto'),{rmdirSync}=await import('node:fs');
+    const file=join(f.home,'session-editor','candidates',createHash('sha256').update(JSON.stringify(f.id)).digest('hex')+'.json');
+    const change=kind==='compress'?{kind,startSeq:0,endSeq:1,text:'facts'}:{kind,seq:0,text:'saved body'};
+    const draft=await f.service.propose(f.id,{...change,expectRevision:f.revision()});
+    mkdirSync(file+'.tmp');
+    const first=await f.service.apply(f.id,draft.candidate.candidateId);assert.equal(first.ok,true);assert.ok(first.warning);
+    await f.service.list(f.id);const count=f.session.snapshotEvents().length;
+    const retry=await f.service.apply(f.id,draft.candidate.candidateId);
+    assert.equal(retry.ok,true);assert.equal(retry.alreadyApplied,true);assert.ok(retry.warning);assert.ok(retry.diagnosticId);
+    assert.equal(f.session.snapshotEvents().length,count);
+    rmdirSync(file+'.tmp');
+    assert.equal((await f.service.apply(f.id,draft.candidate.candidateId)).alreadyApplied,true);
+    assert.equal((await f.service.list(f.id)).candidates[0].status,'applied');f.validate();
+  }finally{f.close();}
+});
 test("local compaction previews, keeps recent tail, preserves originals and supports nested summaries", async () => {
   const f = fixture(); try {
     const before = f.session.snapshotEvents().length;

@@ -3,6 +3,7 @@ import { importHost } from "./host-import.js";
 import { readdirSync, existsSync } from "node:fs";
 import { join } from "node:path";
 import { loadSession, writeValidatedEvents } from "./shadowing.js";
+import { runtimePaths } from './runtime-paths.js';
 import { isCompactionCheckpoint as checkpoint } from "./coverage.js";
 
 export const contentRevision = (events) => createHash("sha256").update(JSON.stringify(events)).digest("hex");
@@ -106,7 +107,8 @@ export async function physicalEdit(ctx, body, detachOwned) {
   const writer = await ctx.sessionPersistence.open(id, "write");
   try {
     signal?.throwIfAborted();
-    const root = join(process.env.DSH_HOME, "sessions");
+    const paths = runtimePaths(ctx);
+    const root = paths.sessions;
     const dir = readdirSync(root).map((d) => join(root, d, id))
       .find((d) => existsSync(join(d, "session.v4.jsonl.zstd")));
     if (!dir) throw new Error("未找到会话日志");
@@ -132,7 +134,7 @@ export async function physicalEdit(ctx, body, detachOwned) {
       new Set(rows.map((e) => e.type)));
     if (ctx.sessions.get(id)) throw new Error("会话被重新激活，未修改历史");
     signal?.throwIfAborted();
-    const sha256 = writeValidatedEvents(dir, events);
+    const sha256 = writeValidatedEvents(dir, events, join(paths.home, 'backups', 'physical-sync'));
     return { ok: true, edit: { targetSeq: seq, newSeq: seq, type: edit.type },
       physicalSync: { ...edit, sha256 }, contentRevision: contentRevision(rows),
       note: "上下文与原始历史已同步，重新载入会话后显示" };

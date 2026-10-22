@@ -4,6 +4,7 @@ import { createHash } from 'node:crypto';
 import { physicalEdit, setMessageBlocks, contentRevision } from './physical-edit.js';
 import { isCompactionCheckpoint } from './coverage.js';
 import { importHost } from './host-import.js';
+import { captureError } from './diagnostics.js';
 
 /** JSON 响应工具（与 index.js 相同约定） */
 export function json(value, status = 200) {
@@ -13,7 +14,8 @@ export function json(value, status = 200) {
   });
 }
 
-export function err(message, status = 400, extra = {}) {
+export function err(message, status = 400, extra = {}, cause) {
+  captureError(cause ?? new Error(message));
   return json({ error: message, ...extra }, status);
 }
 
@@ -169,7 +171,7 @@ export function registerEditRoutes(ctx, route, computeOffline) {
     let id;
     try { id = (await request.clone().json())?.id; } catch { return err("invalid json"); }
     try { return await withSessionWrite(ctx, id, () => handler(request)); }
-    catch (e) { return err(e.message, e.status ?? 500); }
+    catch (e) { return err(e.message, e.status ?? 500, {}, e); }
   });
   // ---- 遮蔽关系：单条定位 + 全量分类 ----
   route("/api/session-editor/shadowing", ["GET"], async (request) => {
@@ -183,7 +185,7 @@ export function registerEditRoutes(ctx, route, computeOffline) {
       const trace = sessionShadowing(events);
       return json({ ok: true, ...locateSeq(trace, seq) });
     } catch (e) {
-      return err(`shadowing failed: ${e?.message ?? e}`, 500);
+      return err(`shadowing failed: ${e?.message ?? e}`, 500, {}, e);
     }
   });
   route("/api/session-editor/shadowing/all", ["GET"], async (request) => {
@@ -208,7 +210,7 @@ export function registerEditRoutes(ctx, route, computeOffline) {
         })),
       });
     } catch (e) {
-      return err(`shadowing/all failed: ${e?.message ?? e}`, 500);
+      return err(`shadowing/all failed: ${e?.message ?? e}`, 500, {}, e);
     }
   });
   // ---- surface 明细（含 role/checkpoint）----
@@ -225,7 +227,7 @@ export function registerEditRoutes(ctx, route, computeOffline) {
         nodes: surfaceNodes(off.events, off.fold, off.deriveEventMessage),
       });
     } catch (e) {
-      return err(`nodes failed: ${e?.message ?? e}`, 500);
+      return err(`nodes failed: ${e?.message ?? e}`, 500, {}, e);
     }
   });
 
@@ -244,7 +246,7 @@ export function registerEditRoutes(ctx, route, computeOffline) {
         note: attached ? "已接管为 live 会话（本进程）" : "会话本就是 live",
       });
     } catch (e) {
-      return err(`attach failed: ${e?.message ?? e}`, 500);
+      return err(`attach failed: ${e?.message ?? e}`, 500, {}, e);
     }
   });
 
@@ -256,7 +258,7 @@ export function registerEditRoutes(ctx, route, computeOffline) {
       if (!id) return err("missing id");
       return json({ ok: true, ...(await detachSession(ctx, id)) });
     } catch (e) {
-      return err(`detach failed: ${e?.message ?? e}`, 500);
+      return err(`detach failed: ${e?.message ?? e}`, 500, {}, e);
     }
   });
 
@@ -290,7 +292,7 @@ export function registerEditRoutes(ctx, route, computeOffline) {
         };
       }));
     } catch (e) {
-      return err(`edit failed: ${e?.message ?? e}`, e.status ?? 500);
+      return err(`edit failed: ${e?.message ?? e}`, e.status ?? 500, {}, e);
     }
   });
 
@@ -342,7 +344,7 @@ export function registerEditRoutes(ctx, route, computeOffline) {
         return { ok: true, edit: { targetSeq: seq, newSeq: event.seq }, note: "节点已从模型可见序列移除（空占位）" };
       }));
     } catch (e) {
-      return err(`delete failed: ${e?.message ?? e}`, e.status ?? 500);
+      return err(`delete failed: ${e?.message ?? e}`, e.status ?? 500, {}, e);
     }
   });
 
@@ -405,7 +407,7 @@ export function registerEditRoutes(ctx, route, computeOffline) {
         return { ok: true, seq: event.seq, note: "已插入并进入模型上下文" };
       }));
     } catch (e) {
-      return err(`insert failed: ${e?.message ?? e}`, e.status ?? 500);
+      return err(`insert failed: ${e?.message ?? e}`, e.status ?? 500, {}, e);
     }
   });
 
@@ -418,7 +420,7 @@ export function registerEditRoutes(ctx, route, computeOffline) {
       if (!id || !Number.isInteger(seq) || !Array.isArray(blocks)) return err("需要 id / seq / blocks");
       return json(await physicalEdit(ctx, body, detachSession));
     } catch (e) {
-      return err(`physical-sync failed: ${e?.message ?? e}`, 500);
+      return err(`physical-sync failed: ${e?.message ?? e}`, 500, {}, e);
     }
   });
   // ---- 编辑压缩摘要（v4 正确序列）----
@@ -433,7 +435,7 @@ export function registerEditRoutes(ctx, route, computeOffline) {
       if (!id || !Number.isInteger(seq) || typeof text !== "string") return err("需要 id / seq / text");
       return json(await physicalEdit(ctx, { ...body, summaryText: text }, detachSession));
     } catch (e) {
-      return err(`summary edit failed: ${e?.message ?? e}`, 500);
+      return err(`summary edit failed: ${e?.message ?? e}`, 500, {}, e);
     }
   });
 }

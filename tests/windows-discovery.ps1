@@ -45,6 +45,15 @@ try{
     $managed=Find-NodeRuntime -App $app -PreferredNode (Join-Path $root 'missing.exe') -Attempts 1
     Assert-True ($managed.path -eq (Join-Path $script:managerRoot 'node.exe')) 'Version manager fallback without PATH'
     Assert-True ($null -eq (Test-NodeRuntime (Join-Path $root 'missing.exe'))) 'Missing runtime must be rejected'
+    $desktop=Join-Path $root 'desktop';New-Item -ItemType Directory -Force -Path (Join-Path $desktop 'resources/runtime/primary-runtime/dependencies/node/bin') | Out-Null
+    [IO.File]::WriteAllText((Join-Path $desktop 'resources/app.asar'),'synthetic-discovery-only')
+    [IO.File]::WriteAllText((Join-Path $desktop 'DeepSeek Harness.exe'),'synthetic-discovery-only')
+    Copy-Item -LiteralPath $NodePath -Destination (Join-Path $desktop 'resources/runtime/primary-runtime/dependencies/node/bin/node.exe')
+    $env:DSH_APP=$desktop;$script:managerRoot=Join-Path $root 'missing-manager'
+    $desktopFound=@(Find-DshCandidates -Attempts 1)
+    Assert-True ($desktopFound.Count -eq 1 -and $desktopFound[0].profile -eq 'desktop') 'Desktop layout discovery'
+    $bundled=Find-NodeRuntime -App $desktop -Attempts 1
+    Assert-True ($bundled.path -eq (Join-Path $desktop 'resources/runtime/primary-runtime/dependencies/node/bin/node.exe')) 'Desktop bundled Node reuse'
     Write-Output 'PASS discovery: quoted processes, deduplication, selected port/home, runtime capability and manager fallback'
 }finally{
     foreach($name in $names){[Environment]::SetEnvironmentVariable($name,$saved[$name],'Process')}

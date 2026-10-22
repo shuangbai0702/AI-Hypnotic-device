@@ -137,14 +137,14 @@ export { buildTrace as sessionShadowing, locate as locateSeq };
 const HERE2 = dirname(fileURLToPath(import.meta.url));
 const BACKUP_DIR2 = join(HERE2, "..", "..", "..", "backups", "physical-sync");
 
-export function writeValidatedEvents(sessionDir, events) {
+export function writeValidatedEvents(sessionDir, events, backupDirectory) {
   assertSequence(events);
   const out = Buffer.concat(events.map((e) => zstdCompressSync(Buffer.from(JSON.stringify(e) + '\n', 'utf8'))));
   const file = join(sessionDir, 'session.v4.jsonl.zstd');
   // Never replace a source that could only be partially read. Caller holds the
   // native write lease; check the complete source again before taking a backup.
   loadSession(sessionDir);
-  const backupDir = process.env.DSH_HOME ? join(process.env.DSH_HOME, "backups", "physical-sync") : BACKUP_DIR2;
+  const backupDir = backupDirectory ?? (process.env.DSH_HOME ? join(process.env.DSH_HOME, "backups", "physical-sync") : BACKUP_DIR2);
   mkdirSync(backupDir, { recursive: true });
   const nonce = randomUUID();
   copyFileSync(file, join(backupDir, `${basename(sessionDir)}-${Date.now()}-${nonce}.zstd`));

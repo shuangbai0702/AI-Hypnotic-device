@@ -52,7 +52,7 @@ window.__ModuleLoader__.load({
 
     function installChatCoverage(ctx) {
       let disposed = false, generation = 0, timer, request, stopChat = () => {};
-      let sessionId, binding, chat, coverage = new Map();
+      let sessionId, binding, chat, coverage = new Map(), stale = false;
       const badges = new Set();
       const clear = () => { for (const badge of badges) badge.remove(); badges.clear(); };
       const paint = () => {
@@ -70,7 +70,7 @@ window.__ModuleLoader__.load({
           const thought = item.thoughtState === 'retained' && item.thoughtCount > 0;
           const text = `● ${visual.label} · #${seq}`;
           const thoughtText = thought ? `含 ${item.thoughtCount} 个保留思考块` : '';
-          const title = visual.explanation + (item.chain.length ? ` 替代路径：#${seq} → ${item.chain.map(n => '#' + n).join(' → ')}` : '');
+          const title = (stale ? '状态刷新失败，以下为上次确认的结果。' : '') + visual.explanation + (item.chain.length ? ` 替代路径：#${seq} → ${item.chain.map(n => '#' + n).join(' → ')}` : '');
           if (!badge) {
             badge = document.createElement('div');
             badge.setAttribute('data-session-editor-coverage', '');
@@ -97,20 +97,19 @@ window.__ModuleLoader__.load({
       async function refresh() {
         request?.abort();
         const controller = request = new AbortController(), stamp = ++generation, target = sessionId;
-        coverage.clear(); clear();
         if (!target) return;
         try {
           const data = await api('/coverage?id=' + encodeURIComponent(target), { signal: controller.signal });
           if (disposed || stamp !== generation || sessionId !== target || ctx.sessions.binding(target) !== binding) return;
-          coverage = new Map(data.items.map(item => [item.seq, item])); paint();
-        } catch (error) { if (error.name !== 'AbortError' && !disposed && stamp === generation) { coverage.clear(); clear(); } }
+          coverage = new Map(data.items.map(item => [item.seq, item])); stale = false; paint();
+        } catch (error) { if (error.name !== 'AbortError' && !disposed && stamp === generation) { stale = true; paint(); } }
       }
       function update() {
         if (disposed) return;
         const next = ctx.uiSession.current.value.key;
         const owner = next ? ctx.sessions.binding(next) : undefined;
         if (next !== sessionId || owner !== binding) {
-          stopChat(); sessionId = next; binding = owner;
+          stopChat(); coverage.clear(); clear(); stale = false; sessionId = next; binding = owner;
           chat = owner ? ctx.uiConversation.binding(owner).target('chat') : undefined;
           stopChat = chat?.subscribe(() => { schedule(); clearTimeout(refreshTimer); refreshTimer = setTimeout(refresh, 300); }) ?? (() => {});
           refresh();
@@ -132,19 +131,38 @@ window.__ModuleLoader__.load({
       };
     }
 
+    function reportClientFailure(operation, error, sessionId) {
+      // Reporting uses fetch directly: a failed report must never recurse or
+      // hide the original user-facing error. Drop the arbitrary message line.
+      try {
+        void fetch(API + '/diagnostics/client-error', { method: 'POST', headers: { 'content-type': 'application/json' },
+          body: JSON.stringify({ operation, id: sessionId, error: {
+            name: typeof error?.name === 'string' ? error.name : 'Error',
+            code: typeof error?.code === 'string' ? error.code : undefined,
+            stack: 'Error\n' + String(error?.stack ?? '').split('\n').slice(1, 41).join('\n') } }) }).catch(() => {});
+      } catch { /* Diagnostic failure must preserve the original operation result. */ }
+    }
+
     async function refreshConversation(sessionId) {
-      const session = hostSessions?.binding(sessionId)?.session;
-      if (session) {
-        await session.resync();
-        const state = session.getSnapshot();
-        if (state.openError || state.removed) throw new Error(state.openError?.message ?? "会话尚未恢复，请重试同步");
-      }
+      try {
+        const session = hostSessions?.binding(sessionId)?.session;
+        if (session) {
+          await session.resync();
+          const state = session.getSnapshot();
+          if (state.openError || state.removed) throw new Error(state.openError?.message ?? "会话尚未恢复，请重试同步");
+        }
+      } catch (error) { reportClientFailure('conversation-sync', error, sessionId); throw error; }
     }
 
     async function api(path, opts) {
-      const r = await fetch(API + path, opts);
+      let r;
+      try { r = await fetch(API + path, opts); }
+      catch (error) { if (error.name !== 'AbortError') reportClientFailure('api-network', error); throw error; }
       const j = await r.json().catch(() => ({}));
-      if (!r.ok) throw new Error(j.error || "HTTP " + r.status);
+      if (!r.ok) {
+        const requestId = j.requestId ?? r.headers.get('x-session-editor-request-id');
+        throw new Error((j.error || "HTTP " + r.status) + (requestId ? '（诊断编号：' + requestId + '）' : ''));
+      }
       return j;
     }
     const post = (path, body) => api(path, {
@@ -678,6 +696,7 @@ window.__ModuleLoader__.load({
       const [tab, setTab] = useState("context");
       const [reloadKey, setReloadKey] = useState(0);
       const [syncError, setSyncError] = useState("");
+      const [exporting, setExporting] = useState(false);
       const [focusSeq, setFocusSeq] = useState(null);
       const [summarySeq, setSummarySeq] = useState(null);
       const [visited, setVisited] = useState(['context']);
@@ -700,6 +719,20 @@ window.__ModuleLoader__.load({
           h("button", { style: sty.btn, onClick: onChanged }, "刷新"),
           h("span", { style: sty.help }, "归档原文只读 · 生效摘要可编辑 · 保存自动同步")),
         h("details", { style: sty.details }, h("summary", null, "更多工具与使用说明"),
+          h('div', { style: sty.row }, h('button', { style: sty.btn, disabled: exporting, onClick: async () => {
+            if (exporting) return;
+            setExporting(true); setSyncError('');
+            try {
+              const report = await api('/diagnostics/export');
+              if (!alive.current) return;
+              if (report.logging?.writeFailure) setSyncError('日志写盘失败（' + report.logging.writeFailure + '）；本次导出包含尚保留的内存诊断。');
+              const url = URL.createObjectURL(new Blob([JSON.stringify(report, null, 2)], { type: 'application/json' }));
+              const link = document.createElement('a'); link.href = url; link.download = 'session-editor-diagnostics.json';
+              document.body.appendChild(link); link.click(); link.remove();
+              setTimeout(() => URL.revokeObjectURL(url), 1000);
+            } catch (e) { reportClientFailure('diagnostic-download', e, sessionId); if (alive.current) setSyncError('诊断导出失败：' + e.message); }
+            finally { if (alive.current) setExporting(false); }
+          } }, exporting ? '正在导出…' : '导出脱敏诊断'), h('span', { style: sty.help }, '仅含操作状态与技术堆栈，不含消息、思考、配置或密钥。')),
           h('div', { style: sty.row }, ['coverage', 'history'].map(tabButton),
             h("button", { style: sty.btn, onClick: async () => { const target = sessionId; setSyncError(""); try { await refreshConversation(target); } catch (e) { if (alive.current && target === currentSessionId()) setSyncError(e.message); } finally { if (alive.current && target === currentSessionId()) onChanged(); } } }, "同步左侧")),
           h("div", { style: sty.row },

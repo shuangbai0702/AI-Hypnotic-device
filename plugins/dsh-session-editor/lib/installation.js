@@ -3,6 +3,7 @@ import { join, resolve, dirname, basename, relative, isAbsolute } from 'node:pat
 import { createHash, randomUUID } from 'node:crypto';
 import { createRequire } from 'node:module';
 import { planAdapter, resolveHostFile } from '../host-adapter.mjs';
+import { desktopArchive, desktopYaml } from './desktop-archive.js';
 
 export const hostFiles = ['dsh-agent/lib/index.js', 'dsh-agent-loop/lib/index.js', 'dsh-api-session-controller/lib/client.js']
   .map(name => 'node_modules/@deepseek-ai/' + name);
@@ -30,14 +31,37 @@ function fingerprint(path) {
 }
 export function installPaths(app, home) {
   app = resolve(app); home = resolve(home);
-  const state = join(home, '.session-editor-install');
-  return { app, home, state, config: join(home, 'profiles/web/cordis.patch.yml'),
-    target: join(home, 'profiles/web/node_modules/@shuangbai/dsh-session-editor'),
-    manifest: join(state, 'install.json'), root: join(home, '.session-editor-transactions') };
+  // Recovery must still find its journal when replacement was interrupted
+  // between renaming the old archive and committing the new one.
+  const archive = join(app, 'resources/app.asar');
+  const desktop = exists(archive) || exists(join(home, '.session-editor-transactions-desktop/pending.json'))
+    ? { path: archive, cli: join(archive, 'dsh/node_modules/@deepseek-ai/dsh') } : null;
+  const profile = desktop ? 'desktop' : 'web', suffix = desktop ? '-desktop' : '';
+  const state = join(home, '.session-editor-install' + suffix);
+  return { app, home, state, desktop, profile, config: join(home, 'profiles', profile, 'cordis.patch.yml'),
+    target: join(home, 'profiles', profile, 'node_modules/@shuangbai/dsh-session-editor'),
+    manifest: join(state, 'install.json'), root: join(home, '.session-editor-transactions' + suffix) };
+}
+function checkAdapter(paths, uninstall) {
+  if (!paths.desktop) return planAdapter(paths.app, uninstall);
+  const archiveState = join(paths.app, '.session-editor-adapter/archive.json');
+  if (exists(archiveState)) {
+    const state = JSON.parse(read(archiveState)), current = createHash('sha256').update(fs.readFileSync(paths.desktop.path)).digest('hex');
+    if (![state.original, state.patched].includes(current)) throw new Error('桌面归档已被更新或修改；拒绝覆盖，请先恢复匹配版本');
+    if (createHash('sha256').update(fs.readFileSync(join(paths.app, '.session-editor-adapter/original.asar'))).digest('hex') !== state.original) throw new Error('桌面原始归档备份损坏');
+  }
+  return planAdapter(paths.app, uninstall, {
+    resolveFile: (app, file) => join(app, file),
+    readFile: (file, encoding) => {
+      const name = relative(paths.app, file).replaceAll('\\', '/');
+      return hostFiles.includes(name) ? paths.desktop.archive.read('dsh/' + name).toString(encoding) : fs.readFileSync(file, encoding);
+    },
+  });
 }
 export function prepareConfig(app, before) {
   // Use the selected DSH's exact YAML parser, including fresh stock `[]`.
-  const yaml = createRequire(join(resolve(app), 'package.json'))('js-yaml');
+  const desktop = desktopArchive(resolve(app));
+  const yaml = desktop ? desktopYaml(desktop.archive) : createRequire(join(resolve(app), 'package.json'))('js-yaml');
   const patches = yaml.load(before) ?? [];
   if (!Array.isArray(patches)) throw new Error('DSH profile patch 必须是 YAML 数组；未修改配置');
   const registrations = [];
@@ -55,13 +79,14 @@ export function prepareConfig(app, before) {
 }
 export function preflight(app, home, uninstall = false) {
   const paths = installPaths(app, home);
+  if (paths.desktop) paths.desktop = desktopArchive(paths.app);
   const ownerPath = join(paths.app, '.session-editor-adapter/owner.json');
   if (exists(ownerPath)) {
     const owner = JSON.parse(read(ownerPath));
     if (owner.active && resolve(owner.home) !== paths.home) throw new Error('该 DSH 已绑定其他数据目录；请先从原数据目录卸载，避免影响其他服务');
   }
   if (exists(join(paths.root, 'pending.json'))) throw new Error('存在未完成安装事务；停止目标 DSH 后先运行 --recover');
-  planAdapter(paths.app, uninstall);
+  checkAdapter(paths, uninstall);
   const before = exists(paths.config) ? read(paths.config) : '';
   if (uninstall) {
     const manifest = JSON.parse(read(paths.manifest));
@@ -76,8 +101,9 @@ export function preflight(app, home, uninstall = false) {
 }
 
 function allowedDestinations(paths) {
-  return [...hostFiles.map(file => resolveHostFile(paths.app, file)), join(paths.app, '.session-editor-adapter'),
-    paths.config, paths.target, paths.manifest, join(paths.state, 'previous-plugin')];
+  return [...(paths.desktop ? [paths.desktop.path] : hostFiles.map(file => resolveHostFile(paths.app, file))), join(paths.app, '.session-editor-adapter'),
+    paths.config, paths.target, paths.manifest, join(paths.state, 'previous-plugin'),
+    ...(paths.desktop ? [join(dirname(paths.config), 'package.json'), join(dirname(paths.config), 'pnpm-workspace.yaml')] : [])];
 }
 function validateJournal(paths, journal) {
   const allowed = allowedDestinations(paths);
@@ -180,19 +206,46 @@ export function installTransaction(app, home, source, { uninstall = false, defer
     // Prepare a complete adapter in an isolated miniature host before touching
     // the real host. Only the three explicitly managed modules are copied.
     const hostStage = join(root, 'host');
-    for (const relative of hostFiles) copy(resolveHostFile(paths.app, relative), join(hostStage, relative));
+    for (const relative of hostFiles) {
+      if (paths.desktop) { fs.mkdirSync(dirname(join(hostStage, relative)), { recursive: true }); fs.writeFileSync(join(hostStage, relative), paths.desktop.archive.read('dsh/' + relative)); }
+      else copy(resolveHostFile(paths.app, relative), join(hostStage, relative));
+    }
     if (exists(join(paths.app, 'package.json'))) copy(join(paths.app, 'package.json'), join(hostStage, 'package.json'));
     if (exists(join(paths.app, '.session-editor-adapter'))) copy(join(paths.app, '.session-editor-adapter'), join(hostStage, '.session-editor-adapter'));
     planAdapter(hostStage, uninstall)();
     fs.mkdirSync(join(hostStage, '.session-editor-adapter'), { recursive: true });
     fs.writeFileSync(join(hostStage, '.session-editor-adapter/owner.json'), JSON.stringify({ home: paths.home, active: !uninstall }));
-    const operations = hostFiles.map(relative => ({ destination: resolveHostFile(paths.app, relative), source: join(hostStage, relative) }));
+    const operations = [];
+    if (paths.desktop) {
+      const adapter = join(hostStage, '.session-editor-adapter'), original = join(adapter, 'original.asar');
+      if (!exists(original)) copy(paths.desktop.path, original);
+      const archiveStage = join(root, 'app.asar');
+      if (uninstall) copy(original, archiveStage);
+      else fs.writeFileSync(archiveStage, paths.desktop.archive.rewrite(new Map(hostFiles.map(file => ['dsh/' + file, fs.readFileSync(join(hostStage, file))]))));
+      if (!uninstall) fs.writeFileSync(join(adapter, 'archive.json'), JSON.stringify({ original: createHash('sha256').update(fs.readFileSync(original)).digest('hex'), patched: createHash('sha256').update(fs.readFileSync(archiveStage)).digest('hex') }));
+      operations.push({ destination: paths.desktop.path, source: archiveStage });
+    } else operations.push(...hostFiles.map(relative => ({ destination: resolveHostFile(paths.app, relative), source: join(hostStage, relative) })));
     operations.push({ destination: join(paths.app, '.session-editor-adapter'), source: join(hostStage, '.session-editor-adapter') });
+    if (paths.desktop && !uninstall) {
+      const initial = {
+        'package.json': JSON.stringify({ name: 'dsh-profile-desktop', private: true, dependencies: {}, dsh: { profile: { bundles: ['@deepseek-ai/dsh-base', '@deepseek-ai/dsh-web-app'] } } }, null, 2) + '\n',
+        'pnpm-workspace.yaml': 'packages:\n  - .\n\nnodeLinker: hoisted\nautoInstallPeers: false\n',
+      };
+      for (const [name, content] of Object.entries(initial)) {
+        const destination = join(dirname(paths.config), name);
+        if (!exists(destination)) {
+          const staged = join(root, 'profile-' + name); fs.writeFileSync(staged, content);
+          operations.push({ destination, source: staged });
+        }
+      }
+    }
     const before = exists(paths.config) ? read(paths.config) : '';
     const configStage = join(root, 'config.yml');
+    let restoreConfig = true;
     if (uninstall) {
       const manifest = JSON.parse(read(paths.manifest));
-      fs.writeFileSync(configStage, manifest.configBefore);
+      restoreConfig = manifest.configExisted !== false && !(paths.desktop && manifest.configExisted === undefined && manifest.configBefore === '');
+      if (restoreConfig) fs.writeFileSync(configStage, manifest.configBefore);
       // Uninstalled code is retained in the transaction snapshot, not deleted.
       operations.push({ destination: paths.target, source: manifest.hadPlugin ? join(paths.state, 'previous-plugin') : null });
     } else {
@@ -204,16 +257,16 @@ export function installTransaction(app, home, source, { uninstall = false, defer
       for (const entry of fs.readdirSync(join(source, 'lib'), { withFileTypes: true })) {
         if (entry.isFile() && /\.(?:js|mjs)$/.test(entry.name)) copy(join(source, 'lib', entry.name), join(pluginStage, 'lib', entry.name));
       }
-      fs.writeFileSync(join(pluginStage, 'host.json'), JSON.stringify({ app: paths.app }, null, 2));
+      fs.writeFileSync(join(pluginStage, 'host.json'), JSON.stringify({ app: paths.desktop?.cli ?? paths.app, home: paths.home }, null, 2));
       operations.push({ destination: paths.target, source: pluginStage });
       if (!exists(paths.manifest)) {
         const manifestStage = join(root, 'install.json');
-        fs.writeFileSync(manifestStage, JSON.stringify({ app: paths.app, configBefore: before, configAfter: read(configStage), hadPlugin: exists(paths.target) }, null, 2));
+        fs.writeFileSync(manifestStage, JSON.stringify({ app: paths.app, configBefore: before, configExisted: exists(paths.config), configAfter: read(configStage), hadPlugin: exists(paths.target) }, null, 2));
         operations.push({ destination: paths.manifest, source: manifestStage });
         if (exists(paths.target)) operations.push({ destination: join(paths.state, 'previous-plugin'), source: paths.target });
       }
     }
-    operations.push({ destination: paths.config, source: configStage });
+    operations.push({ destination: paths.config, source: restoreConfig ? configStage : null });
     for (const [index, operation] of operations.entries()) {
       const entry = { destination: operation.destination, backup: join(root, 'before', String(index)), staged: join(root, 'after', String(index)), before: fingerprint(operation.destination), after: fingerprint(operation.source), attempted: false };
       if (entry.before !== null) copy(operation.destination, entry.backup);

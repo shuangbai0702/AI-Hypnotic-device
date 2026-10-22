@@ -14,6 +14,7 @@
 $ErrorActionPreference = 'Stop'
 $PackageRoot = Split-Path -Parent $PSScriptRoot
 . (Join-Path $PSScriptRoot 'Discovery.ps1')
+. (Join-Path $PSScriptRoot 'Desktop.ps1')
 if ($Discover) {
     try { $found=@(Find-DshCandidates -PreferredPort $Port); @{ok=$true;candidates=$found} | ConvertTo-Json -Depth 5 | Set-Content -LiteralPath $ResultFile -Encoding UTF8; exit 0 }
     catch { @{ok=$false;error=$_.Exception.Message} | ConvertTo-Json | Set-Content -LiteralPath $ResultFile -Encoding UTF8; exit 1 }
@@ -41,6 +42,7 @@ function Invoke-Install {
         $script:AppPath=$selected.app
         if(-not $DshHome){$script:DshHome=$selected.home}
     }
+    if (Test-DesktopApp $AppPath) { return Invoke-DesktopInstall }
     if (-not (Test-DshApp $AppPath)) { throw '未找到有效 DSH 程序目录，请重新自动检测或在高级选项选择目录。' }
     $script:AppPath = (Resolve-Path -LiteralPath $AppPath).Path
     if(-not $DshHome){$script:DshHome=if($env:DSH_HOME){$env:DSH_HOME}else{Join-Path $env:USERPROFILE '.dsh'}}
@@ -204,9 +206,10 @@ $timer=New-Object Windows.Forms.Timer;$timer.Interval=250
 $script:worker=$null;$script:workerResult=$null;$script:workerKind='';$script:detected=@()
 function Update-Controls {
     $busy=$null -ne $script:worker
+    $desktopTarget=Test-DesktopApp $appBox.Text
     $canInstall=-not $busy -and ($advanced.Checked -or $targets.SelectedIndex -ge 0) -and $appBox.Text -and $homeBox.Text
     $installButton.Enabled=[bool]$canInstall;$removeButton.Enabled=[bool]$canInstall;$scanButton.Enabled=-not $busy;$targets.Enabled=-not $busy;$advanced.Enabled=-not $busy
-    $appBox.ReadOnly=$busy -or -not $advanced.Checked;$homeBox.ReadOnly=$busy -or -not $advanced.Checked;$portBox.ReadOnly=$busy -or -not $advanced.Checked
+    $appBox.ReadOnly=$busy -or -not $advanced.Checked;$homeBox.ReadOnly=$busy -or -not $advanced.Checked;$portBox.ReadOnly=$busy -or -not $advanced.Checked;$portBox.Enabled=-not $desktopTarget
     foreach($button in $browseButtons){$button.Enabled=$advanced.Checked -and -not $busy}
 }
 function Start-Background([string]$Kind,[string[]]$Extra) {
@@ -228,7 +231,7 @@ function Start-InstallWorker([bool]$Remove) {
 $targets.Add_SelectedIndexChanged({
     if($targets.SelectedIndex -ge 0 -and $targets.SelectedIndex -lt $script:detected.Count){
         $choice=$script:detected[$targets.SelectedIndex];$appBox.Text=$choice.app;$homeBox.Text=$choice.home;$portBox.Text=[string]$choice.port
-        $hint.Text='已识别 DSH '+$choice.version+'；核对目标后点击安装。'
+        $hint.Text=if($choice.profile -eq 'desktop'){'已识别桌面端；请先完全退出。端口由桌面自动分配，下方网页端口不适用。'}else{'已识别 DSH '+$choice.version+'；核对目标后点击安装。'}
     };Update-Controls
 })
 $advanced.Add_CheckedChanged({Update-Controls})
@@ -250,7 +253,7 @@ $timer.Add_Tick({
                 else{$hint.Text='未找到 DSH，可重新检测或展开高级选项。';$status.Text='已自动重试。请确认 DSH 已安装或正在运行。'}
             }else{$status.Text=if($result){$result.error}else{'自动检测未完成，请重试。'}}
         }else{
-            $status.Text=if($result -and $result.ok){if($result.uninstalled){'卸载和网页健康验证完成。'}else{'安装和插件健康验证完成。已打开 DSH，在会话右侧 + 中打开编辑器。'}}elseif($result){$result.error}else{'安装未完成，未收到结果。请检查日志和待恢复事务。'}
+            $status.Text=if($result -and $result.ok){if($result.profile -eq 'desktop'){if($result.windowStart -in @('exited-before-verification','launch-failed')){'桌面文件和 Host 验证成功，但窗口启动失败；不能判定整体可用。'}elseif($result.uninstalled){'桌面卸载及 Host 验证完成；窗口仍需另行核对。'}else{'桌面安装及 Host 验证完成；窗口仍需另行核对。'}}elseif($result.uninstalled){'卸载和网页健康验证完成。'}else{'安装和插件健康验证完成。已打开 DSH，在会话右侧 + 中打开编辑器。'}}elseif($result){$result.error}else{'安装未完成，未收到结果。请检查日志和待恢复事务。'}
         };Update-Controls
     }
 })

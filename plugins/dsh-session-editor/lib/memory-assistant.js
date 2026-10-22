@@ -2,6 +2,7 @@ import { readFileSync } from "node:fs";
 import { randomUUID } from "node:crypto";
 import { contentRevision } from "./physical-edit.js";
 import { isCompactionCheckpoint, memoryAccess } from "./coverage.js";
+import { operationError, getDiagnostics, captureError, sessionReference } from './diagnostics.js';
 
 // Durable identity + lineage, without a backend-specific filesystem side channel.
 const PREFIX = "session-editor-memory-";
@@ -139,6 +140,7 @@ export function createMemoryAssistant(ctx, dispatch) {
       defs.push({ name, description, parameters,
         output: { schema: { type: "object", additionalProperties: true }, render: (_args, value) => [{ type: "text", text: JSON.stringify(value) }] },
         async execute(args, exec) {
+          const started = performance.now();
           let result;
           try {
             check(exec?.signal);
@@ -148,7 +150,13 @@ export function createMemoryAssistant(ctx, dispatch) {
             result = await run(args, signal);
             if (writes) s.changeCount++;
             result = { ok: true, ...result, changeCount: s.changeCount };
-          } catch (e) { result = { ok: false, error: String(e?.message ?? e), status: e.status ?? 500, changeCount: s.changeCount }; }
+          } catch (e) {
+            const diagnosticId = operationError(ctx, name, e, s.targetId);
+            result = { ok: false, error: String(e?.message ?? e), status: e.status ?? 500, diagnosticId, changeCount: s.changeCount };
+          }
+          getDiagnostics(ctx).record({ event: 'assistant.tool', level: result.ok ? 'info' : 'warn', operation: name,
+            sessionRef: sessionReference(s.targetId), diagnosticId: result.diagnosticId,
+            status: result.ok ? 200 : result.status, durationMs: Math.round(performance.now() - started), changeCount: s.changeCount });
           result = JSON.parse(JSON.stringify(result));
           s.results.push({ name, time: Date.now(), ...result });
           if (s.results.length > 20) s.results.shift();
@@ -260,27 +268,13 @@ export function createMemoryAssistant(ctx, dispatch) {
       if (!m.checkpoint) throw fail("目标不是摘要");
       return writeResult(await call("summary/edit", s.targetId, { seq: a.seq, text: a.text, expectRevision: a.expectRevision }, signal));
     }), true);
-    tool("remove_from_context", "仅将当前节点移出上下文，保留原始历史。必须提供 revision；目标正在生成则拒绝。", object({ seq: num, expectRevision: str }, ["seq", "expectRevision"]), async (a, signal) => {
-      // Attach through the same business gate first, then maintenance prevents a turn starting
-      // between the live revision comparison and the synchronous surface append.
-      if (ctx.agents.get(s.targetId)?.status === "running") throw fail("目标会话正在生成", 409);
-      const attached = await call("attach", s.targetId, {}, signal);
-      try {
-        const agent = ctx.agents.get(s.targetId);
-        if (!agent?.runMaintenance) throw fail("宿主缺少安全维护接口，未修改", 409);
-        return await agent.runMaintenance(maintenanceSignal => {
-          const activeSignal = maintenanceSignal && signal ? AbortSignal.any([maintenanceSignal, signal]) : signal ?? maintenanceSignal;
-          return write(a, activeSignal, async () => {
-            if (contentRevision(agent.session.snapshotEvents()) !== a.expectRevision) throw fail("版本冲突", 409);
-            const nodes = await call("nodes", s.targetId, null, activeSignal);
-            if (contentRevision(agent.session.snapshotEvents()) !== a.expectRevision) throw fail("版本冲突", 409);
-            return writeResult(await call("delete-node", s.targetId, { seq: a.seq, expectRevision: a.expectRevision, expectGeneration: nodes.contentGeneration }, activeSignal));
-          });
-        });
-      } finally {
-        if (attached.attached) await call("detach", s.targetId, {});
-      }
-    }, true);
+    tool("remove_from_context", "仅将当前节点移出上下文，保留原始历史。必须提供 revision；目标正在生成则拒绝。", object({ seq: num, expectRevision: str }, ["seq", "expectRevision"]), async (a, signal) => write(a, signal, async () => {
+      // The business route releases the resident owner, holds the exclusive
+      // persistence lease and checks revision again. Never maintain that same
+      // owner here: releasing it would wait for this very tool to finish.
+      const nodes = await call("nodes", s.targetId, null, signal);
+      return writeResult(await call("delete-node", s.targetId, { seq: a.seq, expectRevision: a.expectRevision, expectGeneration: nodes.contentGeneration }, signal));
+    }), true);
     return defs;
   }
   function configure(s, agentCtx, agent, openingSignal) {
@@ -426,7 +420,7 @@ export function createMemoryAssistant(ctx, dispatch) {
           s.handle.agent.followup({ id: randomUUID(), role: "user", content: [{ type: "text", text: body.text }], source: { kind: "user" } });
         } else throw fail("未知助手接口", 404);
         return json(status(id));
-      } catch (e) { return json({ ok: false, error: String(e?.message ?? e) }, e.status ?? 500); }
+      } catch (e) { captureError(e); return json({ ok: false, error: String(e?.message ?? e) }, e.status ?? 500); }
     },
   };
 }

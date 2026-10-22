@@ -23,6 +23,7 @@
 !/packaging/windows/Build.ps1
 !/packaging/windows/Installer.ps1
 !/packaging/windows/Discovery.ps1
+!/packaging/windows/Desktop.ps1
 !/packaging/windows/Launcher.cs
 !/packaging/windows/README.md
 !/scripts/
@@ -39,10 +40,13 @@
 !/tests/memory-ergonomics-client.mjs
 !/tests/native-chat-projection.mjs
 !/tests/storage-integrity.mjs
+!/tests/runtime-diagnostics.mjs
 !/tests/installer-transaction.mjs
 !/tests/native-session-e2e.mjs
 !/tests/windows-installation-e2e.ps1
 !/tests/windows-discovery.ps1
+!/tests/desktop-installation.mjs
+!/tests/windows-desktop-e2e.ps1
 !/tests/windows-health-rollback.ps1
 !/docs/
 /docs/*
