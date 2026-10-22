@@ -73,6 +73,26 @@ test('fresh desktop uninstall restores absent patch instead of an invalid empty 
     assert.equal(fs.existsSync(f.paths.config), false); assert.deepEqual(fs.readFileSync(f.path), f.bytes);
   } finally { f.close(); }
 });
+test('desktop uninstall retains later model settings and can roll back before health confirmation', () => {
+  const f = fixture(); try {
+    fs.unlinkSync(f.paths.config);
+    installTransaction(f.app, f.home, source);
+    const installed = fs.readFileSync(f.path), manifest = fs.readFileSync(f.paths.manifest);
+    const config = fs.readFileSync(f.paths.config, 'utf8') + '- id: user-model\n  config: { model: selected-later }\n';
+    fs.writeFileSync(f.paths.config, config);
+    installTransaction(f.app, f.home, source, { uninstall: true, deferHealth: true });
+    assert.deepEqual(fs.readFileSync(f.path), f.bytes);
+    assert.equal(fs.existsSync(f.paths.manifest), false);
+    assert.match(fs.readFileSync(f.paths.config, 'utf8'), /selected-later/);
+    assert.doesNotMatch(fs.readFileSync(f.paths.config, 'utf8'), /@shuangbai/);
+    recoverInstallation(f.app, f.home);
+    assert.deepEqual(fs.readFileSync(f.path), installed);
+    assert.deepEqual(fs.readFileSync(f.paths.manifest), manifest);
+    assert.equal(fs.readFileSync(f.paths.config, 'utf8'), config);
+    installTransaction(f.app, f.home, source, { uninstall: true });
+    assert.match(fs.readFileSync(f.paths.config, 'utf8'), /selected-later/);
+  } finally { f.close(); }
+});
 test('unknown desktop shell build refuses preflight before any target mutation', () => {
   const f = fixture(); try {
     fs.writeFileSync(f.path, readArchive(f.bytes).rewrite(new Map([['package.json', Buffer.from('{"name":"@deepseek-ai/dsh-desktop","version":"9.0.0"}')]])));

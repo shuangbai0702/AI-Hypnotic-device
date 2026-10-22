@@ -58,7 +58,7 @@ node package/install.mjs --app "D:/path/to/dsh" --home "D:/path/to/dsh-home"
 
 `--app` 是包含 lib/bin.js 的 **DSH 程序目录**，依赖按所选宿主实际模块解析路径定位，支持 npm 提升安装；`--home` 是该服务的 **DSH_HOME**。安装器结构化修改 YAML，兼容默认 `[]`。命令行直接调用只确认文件事务，不能代表网页已启动；Windows EXE 会进一步验证网页和插件健康。
 
-未发布源码也可把 `--app` 指向含 `DeepSeek Harness.exe` 和 `resources/app.asar` 的 Windows 桌面目录，当前只接受 `0.2.1-rc.2` 的已知官方桌面构建。三个核心文件仍执行哈希和唯一结构检查；ASAR 通过同一持久事务替换，完整原件保留用于卸载，插件使用独立的 `desktop` profile。EXE 复用桌面自带 Node，临时启动官方 Host 验证后退出。`healthScope=desktop-host` 不代表本次安装已验证原生窗口；隔离官方窗口的编辑、压缩、连续移出后续聊和重启交互另已验收。不支持的桌面构建拒绝修改，安装器图形按钮及默认发现路径未全部验收。
+0.4.0 起也可把 `--app` 指向含 `DeepSeek Harness.exe` 和 `resources/app.asar` 的 Windows 桌面目录，当前只接受 `0.2.1-rc.2` 的已知官方桌面构建。三个核心文件仍执行哈希和唯一结构检查；ASAR 通过同一持久事务替换，完整原件保留用于卸载，插件使用独立的 `desktop` profile。EXE 复用桌面自带 Node，临时启动官方 Host 验证后退出。`healthScope=desktop-host` 不代表本次安装已验证原生窗口；隔离官方窗口的编辑、压缩、连续移出后续聊和重启交互另已验收。不支持的桌面构建拒绝修改，安装器图形按钮及默认发现路径未全部验收。
 
 `--check` 只读预检；`--defer-health` 提交后保留待验证事务，服务健康通过后执行 `--complete`。失败或进程中断时先停止目标服务，再执行同样 app/home 参数并加 `--recover` 回滚。若文件有第三方改动，会保留事务及备份并拒绝覆盖。同一宿主只能绑定一个活动安装数据目录。
 
@@ -72,7 +72,7 @@ node package/install.mjs --app "D:/path/to/dsh" --home "D:/path/to/dsh-home"
 node package/install.mjs --app "D:/path/to/dsh" --home "D:/path/to/dsh-home" --uninstall
 ```
 
-恢复宿主原文件及安装前配置/插件；卸下的包保存在 DSH_HOME/.session-editor-transactions 的事务快照中。若安装后宿主或配置又有其他修改，拒绝覆盖。会话内容不会随卸载回滚；如需回滚消息，可使用对应的历史备份。旧 log-rewrite.mjs 仅保留 inspect 只读诊断；其直接写入、恢复及贪婪修复命令已禁用，所有会话改写须经过网页编辑器的原生写租约和完整校验。
+恢复宿主原文件及安装前插件；卸下的包保存在 DSH_HOME/.session-editor-transactions 的事务快照中。配置未变化时恢复原件；当前源码可仅移除安装器新增且未被改动的完整注册，保留后续模型等设置，语义保留但 YAML 排版和注释可能变化。插件注册被修改、重复或归属不明，以及宿主被其他程序修改时，仍拒绝覆盖。卸载成功会退役安装记录，下次安装重新记录基线；上述修复已包含于 0.4.1。会话内容不会随卸载回滚；如需回滚消息，可使用对应的历史备份。旧 log-rewrite.mjs 仅保留 inspect 只读诊断；其直接写入、恢复及贪婪修复命令已禁用，所有会话改写须经过网页编辑器的原生写租约和完整校验。
 
 当前版本不提供插入消息 GUI、所有历史备份的通用恢复浏览器或历史虚拟列表。候选审核及候选快照的字段恢复已提供。已被压缩的原文只读，通过生效摘要调整后续上下文。其他已打开的页面需自行同步或刷新。
 

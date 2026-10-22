@@ -1,6 +1,7 @@
 ﻿param([Parameter(Mandatory=$true)][string]$NodePath)
 $ErrorActionPreference='Stop'
 . (Join-Path $PSScriptRoot '../packaging/windows/Discovery.ps1')
+. (Join-Path $PSScriptRoot '../packaging/windows/Desktop.ps1')
 $NodePath=(Resolve-Path -LiteralPath $NodePath).Path
 $root=Join-Path ([IO.Path]::GetTempPath()) ('dsh-discovery-'+[guid]::NewGuid().ToString())
 $root=[IO.Path]::GetFullPath($root)
@@ -54,6 +55,19 @@ try{
     Assert-True ($desktopFound.Count -eq 1 -and $desktopFound[0].profile -eq 'desktop') 'Desktop layout discovery'
     $bundled=Find-NodeRuntime -App $desktop -Attempts 1
     Assert-True ($bundled.path -eq (Join-Path $desktop 'resources/runtime/primary-runtime/dependencies/node/bin/node.exe')) 'Desktop bundled Node reuse'
+    $script:capturedHome=$null;$script:launchFails=$false
+    function Start-Process {param($FilePath,$WindowStyle,[switch]$PassThru)
+        $script:capturedHome=$env:DSH_HOME
+        if($script:launchFails){throw 'synthetic launch failure'}
+        return @{executable=$FilePath;windowStyle=$WindowStyle}
+    }
+    $inheritedHome=$env:DSH_HOME
+    $launched=Start-SelectedDesktopWindow 'synthetic-desktop.exe' $dataHome
+    Assert-True ($script:capturedHome -eq $dataHome -and $launched.windowStyle -eq 'Normal') 'Desktop launch must inherit selected home and show the window'
+    Assert-True ($env:DSH_HOME -eq $inheritedHome) 'Successful launch restores installer environment'
+    $script:launchFails=$true
+    try{Start-SelectedDesktopWindow 'synthetic-desktop.exe' $dataHome;throw 'Expected launch failure'}catch{if($_.Exception.Message -ne 'synthetic launch failure'){throw}}
+    Assert-True ($env:DSH_HOME -eq $inheritedHome) 'Failed launch restores installer environment'
     Write-Output 'PASS discovery: quoted processes, deduplication, selected port/home, runtime capability and manager fallback'
 }finally{
     foreach($name in $names){[Environment]::SetEnvironmentVariable($name,$saved[$name],'Process')}

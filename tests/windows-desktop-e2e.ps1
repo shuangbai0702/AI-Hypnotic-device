@@ -54,7 +54,13 @@ if($NativeWire){
     }finally{$owned.Dispose();Remove-Item Env:ELECTRON_RUN_AS_NODE -ErrorAction SilentlyContinue}
 }
 Run-Exe 'desktop-reinstall'
+$settingsPath=Join-Path $dataHome 'profiles/desktop/cordis.patch.yml'
+# Simulate the same provider patch written by the native model settings UI.
+# No request is sent to this reserved, synthetic endpoint.
+[IO.File]::AppendAllText($settingsPath,"`n- id: llm-pi-ai`n  name: '@deepseek-ai/dsh-llm-pi-ai'`n  config:`n    providers:`n      install-qa:`n        apiKeyEnv: SYNTHETIC_INSTALL_QA_KEY`n        api: openai-completions`n        baseURL: https://example.invalid/v1`n        models:`n          - id: retained-model`n")
 Run-Exe 'desktop-uninstall' -Remove
+if([IO.File]::ReadAllText($settingsPath) -notmatch 'retained-model' -or [IO.File]::ReadAllText($settingsPath) -match '@shuangbai/dsh-session-editor'){throw 'Uninstall did not preserve later provider settings'}
+if(Test-Path -LiteralPath $manifest){throw 'Uninstall left active install record'}
 if((Get-FileHash -LiteralPath $archive).Hash -ne $original){throw 'Desktop original archive bytes not restored'}
 if([IO.File]::ReadAllText($credential) -ne $credentialText){throw 'Desktop credential bytes changed'}
 Run-Exe 'desktop-reinstall-after-removal'

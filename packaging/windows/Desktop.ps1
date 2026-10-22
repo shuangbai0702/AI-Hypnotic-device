@@ -5,6 +5,13 @@
     return (Test-Path -LiteralPath (Join-Path $Directory 'resources/app.asar') -PathType Leaf) -or (Test-Path -LiteralPath (Join-Path $recoveryHome '.session-editor-transactions-desktop/pending.json'))
     } catch { return $false }
 }
+function Start-SelectedDesktopWindow([string]$Executable,[string]$HomeDirectory) {
+    $previousHome=$env:DSH_HOME
+    try {
+        $env:DSH_HOME=$HomeDirectory
+        return Start-Process -FilePath $Executable -WindowStyle Normal -PassThru
+    } finally {$env:DSH_HOME=$previousHome}
+}
 function Invoke-DesktopInstall {
     $script:AppPath=(Resolve-Path -LiteralPath $AppPath).Path
     if(-not $DshHome){$script:DshHome=if($env:DSH_HOME){$env:DSH_HOME}else{Join-Path $env:USERPROFILE '.dsh'}}
@@ -43,7 +50,7 @@ function Invoke-DesktopInstall {
         $windowStart='not-requested'
         if(-not $NoStart -and -not $NoBrowser){
             try {
-                $window=Start-Process -FilePath $desktopExe -WindowStyle Normal -PassThru
+                $window=Start-SelectedDesktopWindow $desktopExe $DshHome
                 try{$windowStart=if($window.WaitForExit(1200)){'exited-before-verification'}else{'started-unverified'}}finally{$window.Dispose()}
             }catch{$windowStart='launch-failed'}
         }

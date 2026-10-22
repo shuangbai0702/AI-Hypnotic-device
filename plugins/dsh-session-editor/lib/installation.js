@@ -2,6 +2,7 @@ import fs from 'node:fs';
 import { join, resolve, dirname, basename, relative, isAbsolute } from 'node:path';
 import { createHash, randomUUID } from 'node:crypto';
 import { createRequire } from 'node:module';
+import { isDeepStrictEqual } from 'node:util';
 import { planAdapter, resolveHostFile } from '../host-adapter.mjs';
 import { desktopArchive, desktopYaml } from './desktop-archive.js';
 
@@ -58,10 +59,13 @@ function checkAdapter(paths, uninstall) {
     },
   });
 }
-export function prepareConfig(app, before) {
+function configYaml(app) {
   // Use the selected DSH's exact YAML parser, including fresh stock `[]`.
   const desktop = desktopArchive(resolve(app));
-  const yaml = desktop ? desktopYaml(desktop.archive) : createRequire(join(resolve(app), 'package.json'))('js-yaml');
+  return desktop ? desktopYaml(desktop.archive) : createRequire(join(resolve(app), 'package.json'))('js-yaml');
+}
+export function prepareConfig(app, before) {
+  const yaml = configYaml(app);
   const patches = yaml.load(before) ?? [];
   if (!Array.isArray(patches)) throw new Error('DSH profile patch 必须是 YAML 数组；未修改配置');
   const registrations = [];
@@ -76,6 +80,33 @@ export function prepareConfig(app, before) {
   const after = yaml.dump([...patches, { insert: [{ id: 'session-editor', name: '@shuangbai/dsh-session-editor', config: {} }] }], { noRefs: true, lineWidth: 120 });
   if (!Array.isArray(yaml.load(after))) throw new Error('生成的 YAML 未通过校验');
   return after;
+}
+function uninstallConfig(paths, current, manifest) {
+  const existed = manifest.configExisted !== false && !(paths.desktop && manifest.configExisted === undefined && manifest.configBefore === '');
+  if (current === manifest.configAfter) return { text: manifest.configBefore, existed };
+  const yaml = configYaml(paths.app);
+  const before = yaml.load(manifest.configBefore) ?? yaml.load('[]'), installed = yaml.load(manifest.configAfter), now = yaml.load(current);
+  // Only remove the whole registration inserted by this installer. An edited,
+  // duplicate or pre-existing registration requires explicit manual resolution.
+  const inserted = installed?.at?.(-1), registration = inserted?.insert?.[0];
+  if (!Array.isArray(before) || !Array.isArray(installed) || !Array.isArray(now) ||
+      installed.length !== before.length + 1 || !isDeepStrictEqual(installed.slice(0, -1), before) ||
+      !inserted || Object.keys(inserted).length !== 1 || !Array.isArray(inserted.insert) || inserted.insert.length !== 1 ||
+      registration?.name !== '@shuangbai/dsh-session-editor' || registration.id !== 'session-editor' ||
+      Object.keys(registration).length !== 3 || !registration.config || Object.keys(registration.config).length !== 0) {
+    throw new Error('安装记录无法安全确定新增注册；未执行卸载');
+  }
+  let registrations = 0;
+  const visit = value => {
+    if (!value || typeof value !== 'object') return;
+    if (value.name === '@shuangbai/dsh-session-editor') registrations++;
+    for (const child of Object.values(value)) if (child && typeof child === 'object') visit(child);
+  };
+  visit(now);
+  const matches = now.map((value, index) => isDeepStrictEqual(value, inserted) ? index : -1).filter(index => index >= 0);
+  if (registrations !== 1 || matches.length !== 1) throw new Error('插件注册已修改或重复；未执行卸载，请先核对配置');
+  const remaining = now.filter((_value, index) => index !== matches[0]);
+  return { text: yaml.dump(remaining, { noRefs: true, lineWidth: 120 }), existed: existed || remaining.length > 0 };
 }
 export function preflight(app, home, uninstall = false) {
   const paths = installPaths(app, home);
@@ -92,7 +123,7 @@ export function preflight(app, home, uninstall = false) {
     const manifest = JSON.parse(read(paths.manifest));
     if (resolve(manifest.app) !== paths.app) throw new Error('安装记录属于其他 DSH');
     if (manifest.hadPlugin && !exists(join(paths.state, 'previous-plugin'))) throw new Error('安装前插件备份缺失；拒绝卸载');
-    if (before !== manifest.configAfter) throw new Error('安装后配置有其他修改；未执行卸载');
+    uninstallConfig(paths, before, manifest);
   } else {
     prepareConfig(paths.app, before);
     if (exists(paths.manifest) && resolve(JSON.parse(read(paths.manifest)).app) !== paths.app) throw new Error('此数据目录已绑定其他 DSH');
@@ -198,10 +229,14 @@ export function recoverInstallation(app, home, complete = false) {
 export function installTransaction(app, home, source, { uninstall = false, deferHealth = false, checkpoint = () => {} } = {}) {
   const targetRelative = relative(installPaths(app, home).target, resolve(source));
   if (!targetRelative || (!targetRelative.startsWith('..') && !isAbsolute(targetRelative))) throw new Error('不能从已安装的插件目录覆盖自身；请使用独立安装包');
-  const paths = preflight(app, home, uninstall), release = acquire(paths);
+  let paths = preflight(app, home, uninstall);
+  const release = acquire(paths);
   const id = randomUUID(), root = join(paths.root, id), file = join(root, 'journal.json');
   const journal = { id, app: paths.app, home: paths.home, operation: uninstall ? 'uninstall' : 'install', phase: 'preparing', entries: [] };
   try {
+    // Refresh the captured archive and owner/config checks after acquiring both
+    // locks; another installer may have completed while this one was probing.
+    paths = preflight(app, home, uninstall);
     if (exists(join(paths.root, 'pending.json'))) throw new Error('另一个安装器留下待确认事务；请先恢复');
     // Prepare a complete adapter in an isolated miniature host before touching
     // the real host. Only the three explicitly managed modules are copied.
@@ -244,10 +279,13 @@ export function installTransaction(app, home, source, { uninstall = false, defer
     let restoreConfig = true;
     if (uninstall) {
       const manifest = JSON.parse(read(paths.manifest));
-      restoreConfig = manifest.configExisted !== false && !(paths.desktop && manifest.configExisted === undefined && manifest.configBefore === '');
-      if (restoreConfig) fs.writeFileSync(configStage, manifest.configBefore);
+      const restored = uninstallConfig(paths, before, manifest);
+      restoreConfig = restored.existed;
+      if (restoreConfig) fs.writeFileSync(configStage, restored.text);
       // Uninstalled code is retained in the transaction snapshot, not deleted.
       operations.push({ destination: paths.target, source: manifest.hadPlugin ? join(paths.state, 'previous-plugin') : null });
+      operations.push({ destination: paths.manifest, source: null });
+      if (exists(join(paths.state, 'previous-plugin'))) operations.push({ destination: join(paths.state, 'previous-plugin'), source: null });
     } else {
       fs.writeFileSync(configStage, prepareConfig(paths.app, before));
       const pluginStage = join(root, 'plugin'); fs.mkdirSync(join(pluginStage, 'lib'), { recursive: true });
