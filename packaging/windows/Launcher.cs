@@ -34,7 +34,23 @@ internal static class Launcher
             var start = new ProcessStartInfo(shell, command);
             start.UseShellExecute = false;
             start.CreateNoWindow = true;
-            using (Process process = Process.Start(start)) { process.WaitForExit(); return process.ExitCode; }
+            start.RedirectStandardError = true;
+            using (Process process = Process.Start(start))
+            {
+                var errorOutput = process.StandardError.ReadToEndAsync();
+                process.WaitForExit();
+                string detail = errorOutput.GetAwaiter().GetResult();
+                // GUI startup failures otherwise vanish with the hidden shell.
+                // Command-line automation receives the exit code without dialogs.
+                bool background = Array.Exists(args, arg =>
+                    String.Equals(arg, "-Apply", StringComparison.OrdinalIgnoreCase) ||
+                    String.Equals(arg, "-Discover", StringComparison.OrdinalIgnoreCase) ||
+                    String.Equals(arg, "-UpdateOnly", StringComparison.OrdinalIgnoreCase));
+                if (process.ExitCode != 0 && !background)
+                    MessageBox.Show("安装器未能启动。请确认安装包已完整解压，系统允许 Windows PowerShell 和 .NET Framework 运行。\n\n" +
+                        (detail.Length > 2500 ? detail.Substring(0, 2500) : detail), "AI Hypnotic device", MessageBoxButtons.OK, MessageBoxIcon.Error);
+                return process.ExitCode;
+            }
         }
         catch (Exception error)
         {

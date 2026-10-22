@@ -1,4 +1,4 @@
-﻿param([Parameter(Mandatory=$true)][string]$QaRoot,[Parameter(Mandatory=$true)][string]$InstallerRoot,[switch]$NativeWire)
+﻿param([Parameter(Mandatory=$true)][string]$QaRoot,[Parameter(Mandatory=$true)][string]$InstallerRoot,[switch]$NativeWire,[string[]]$LegacyInstallerRoots=@())
 $ErrorActionPreference='Stop'
 $workspace=(Resolve-Path -LiteralPath (Join-Path $PSScriptRoot '../testdata')).Path
 $QaRoot=(Resolve-Path -LiteralPath $QaRoot).Path
@@ -38,6 +38,13 @@ $secret=[Convert]::ToBase64String([byte[]](1..32)).TrimEnd('=').Replace('+','-')
 $credentialText="version: 1`nrefs: {}`nrecords:`n  client-connection/browser-session:`n    kind: grant`n    payload:`n      version: 1`n      secret: $secret`n# synthetic-desktop-credential-preserve`n"
 [IO.File]::WriteAllText($credential,$credentialText)
 Run-Exe 'desktop-install'
+foreach($legacyRoot in $LegacyInstallerRoots){
+    $newRoot=$InstallerRoot;$beforeArchive=(Get-FileHash -LiteralPath $archive).Hash;$beforeRecord=[IO.File]::ReadAllText($manifest)
+    $packagePath=Join-Path $dataHome 'profiles/desktop/node_modules/@shuangbai/dsh-session-editor/package.json';$beforePackage=[IO.File]::ReadAllText($packagePath)
+    try{$InstallerRoot=(Resolve-Path -LiteralPath $legacyRoot).Path;Run-Exe ('legacy-refused-'+(Split-Path $InstallerRoot -Leaf)) -ExpectFailure}
+    finally{$InstallerRoot=$newRoot}
+    if((Get-FileHash -LiteralPath $archive).Hash -ne $beforeArchive -or [IO.File]::ReadAllText($manifest) -ne $beforeRecord -or [IO.File]::ReadAllText($packagePath) -ne $beforePackage){throw 'Legacy installer modified the new installation'}
+}
 if($NativeWire){
     $env:EDITOR_TEST_DISPOSABLE='yes';$env:EDITOR_TEST_APP=Join-Path $archive 'dsh/node_modules/@deepseek-ai/dsh';$env:EDITOR_TEST_HOME=$dataHome;$env:EDITOR_TEST_PORT='3198'
     $env:EDITOR_TEST_DESKTOP_RUNTIME=Join-Path $archive 'dsh';$env:EDITOR_TEST_PRIMARY_RUNTIME=Join-Path $app 'resources/runtime/primary-runtime';$env:ELECTRON_RUN_AS_NODE='1'

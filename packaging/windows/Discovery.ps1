@@ -6,6 +6,14 @@ function Test-DshDirectory([string]$Directory) {
 function Get-NodeProcesses {
     return @(Get-CimInstance Win32_Process -Filter "Name='node.exe'" -ErrorAction SilentlyContinue)
 }
+function Get-PreferredDshIndex([object[]]$Candidates,[int]$PreferredPort=3080) {
+    if($Candidates.Count -eq 1){return 0}
+    $matches=@(for($i=0;$i -lt $Candidates.Count;$i++){
+        if($Candidates[$i].source -eq '正在运行' -and $Candidates[$i].profile -eq 'web' -and $Candidates[$i].port -eq $PreferredPort){$i}
+    })
+    if($matches.Count -eq 1){return [int]$matches[0]}
+    return -1
+}
 function Get-ProcessDshApp($Process) {
     if (-not $Process -or $Process.Name -ne 'node.exe') { return $null }
     $match = [regex]::Match($Process.CommandLine, '(?:"(?<bin>[^"\r\n]+[\\/]lib[\\/]bin\.js)"|(?<bin>[^\s"]+[\\/]lib[\\/]bin\.js))')

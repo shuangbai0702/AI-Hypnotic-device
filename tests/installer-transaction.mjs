@@ -5,6 +5,7 @@ import { join, resolve } from 'node:path';
 import { tmpdir } from 'node:os';
 import { spawnSync } from 'node:child_process';
 import { createRequire } from 'node:module';
+import { compareVersions } from '../plugins/dsh-session-editor/lib/install-version.js';
 import { installTransaction, recoverInstallation, preflight, installPaths, hostFiles, prepareConfig } from '../plugins/dsh-session-editor/lib/installation.js';
 const source = resolve('plugins/dsh-session-editor');
 const yaml = createRequire(resolve('app/package.json'))('js-yaml');
@@ -95,6 +96,7 @@ test('reinstall after uninstall records the new configuration baseline', () => {
 test('uninstall restores a pre-existing plugin and rollback preserves its backup', () => {
   const f = fixture(); try {
     fs.mkdirSync(f.paths.target, { recursive: true });
+    fs.writeFileSync(join(f.paths.target, 'package.json'), JSON.stringify({name:'@shuangbai/dsh-session-editor',version:'0.1.0'}));
     fs.writeFileSync(join(f.paths.target, 'AGENT.md'), 'synthetic user prompt');
     fs.writeFileSync(join(f.paths.target, 'prior.txt'), 'pre-existing plugin');
     installTransaction(f.app, f.home, source);
@@ -109,6 +111,66 @@ test('uninstall restores a pre-existing plugin and rollback preserves its backup
     assert.equal(fs.readFileSync(join(f.paths.target, 'prior.txt'), 'utf8'), 'pre-existing plugin');
     assert.equal(fs.existsSync(f.paths.manifest), false);
   } finally { f.close(); }
+});
+
+test('semantic versions order numeric, stable and prerelease versions without rounding', () => {
+  for (const [a,b] of [['0.9.9','0.10.0'],['1.0.0-rc.9','1.0.0-rc.10'],['1.0.0-rc.10','1.0.0'],['1.0.0-1','1.0.0-a'],['1.0.0-a','1.0.0-a.1'],['999999999999999999.0.0','1000000000000000000.0.0']]) {
+    assert.equal(compareVersions(a,b),-1); assert.equal(compareVersions(b,a),1);
+  }
+  assert.equal(compareVersions('1.0.0+build.1','1.0.0+build.2'),0);
+  for (const bad of ['v1.0.0','01.0.0','1.0','1.0.0-01','1.0.0-','1.0.0\n']) assert.throws(()=>compareVersions(bad,'1.0.0'));
+});
+
+test('versioned installation permits upgrade and repair, rejects downgrade and restores baseline on uninstall', () => {
+  const f=fixture();try {
+    const incoming=join(f.root,'incoming');fs.mkdirSync(join(incoming,'lib'),{recursive:true});
+    for(const name of ['package.json','README.md','AGENT.md','install.mjs','host-adapter.mjs'])fs.copyFileSync(join(source,name),join(incoming,name));
+    for(const entry of fs.readdirSync(join(source,'lib'),{withFileTypes:true}))if(entry.isFile()&&/\.(?:js|mjs)$/.test(entry.name))fs.copyFileSync(join(source,'lib',entry.name),join(incoming,'lib',entry.name));
+    const setVersion=version=>fs.writeFileSync(join(incoming,'package.json'),JSON.stringify({name:'@shuangbai/dsh-session-editor',version}));
+    setVersion('0.9.0');installTransaction(f.app,f.home,incoming);
+    setVersion('0.10.0');installTransaction(f.app,f.home,incoming);installTransaction(f.app,f.home,incoming);
+    assert.equal(JSON.parse(fs.readFileSync(f.paths.manifest)).plugin.version,'0.10.0');
+    const manifest=fs.readFileSync(f.paths.manifest),config=fs.readFileSync(f.paths.config);
+    setVersion('0.9.9');assert.throws(()=>installTransaction(f.app,f.home,incoming),/禁止降级/);
+    assert.deepEqual(fs.readFileSync(f.paths.manifest),manifest);assert.deepEqual(fs.readFileSync(f.paths.config),config);
+    setVersion('0.11.0');
+    assert.throws(()=>installTransaction(f.app,f.home,incoming,{checkpoint:stage=>{if(stage==='committed-5')throw Error('upgrade fault')}}),/upgrade fault/);
+    assert.deepEqual(fs.readFileSync(f.paths.manifest),manifest);assert.equal(JSON.parse(fs.readFileSync(join(f.paths.target,'package.json'))).version,'0.10.0');
+    installTransaction(f.app,f.home,incoming,{uninstall:true});f.assertRestored();
+  }finally{f.close();}
+});
+
+test('legacy record migrates transactionally; malformed and conflicting metadata refuse writes', () => {
+  const f=fixture();try {
+    installTransaction(f.app,f.home,source);
+    const current=JSON.parse(fs.readFileSync(f.paths.manifest));
+    const legacy={...current,app:f.app};delete legacy.schema;delete legacy.plugin;
+    fs.writeFileSync(f.paths.manifest,JSON.stringify(legacy));installTransaction(f.app,f.home,source);
+    assert.equal(JSON.parse(fs.readFileSync(f.paths.manifest)).schema,2);
+    for (const record of [{...current,schema:99},{...current,plugin:{...current.plugin,version:'999.0.0'}},'{broken']) {
+      fs.writeFileSync(f.paths.manifest,typeof record==='string'?record:JSON.stringify(record));
+      assert.throws(()=>preflight(f.app,f.home),/记录/);
+    }
+    fs.writeFileSync(f.paths.manifest,JSON.stringify(current));
+    fs.unlinkSync(join(f.paths.target,'package.json'));assert.throws(()=>preflight(f.app,f.home),/版本/);
+  }finally{f.close();}
+});
+
+test('published legacy installers refuse a versioned installation before writes', {skip:!process.env.LEGACY_INSTALLERS}, () => {
+  const f=fixture();try {
+    installTransaction(f.app,f.home,source);
+    const files=[f.paths.manifest,f.paths.config,join(f.paths.target,'package.json'),...hostFiles.map(file=>join(f.app,file))];
+    const before=files.map(file=>fs.readFileSync(file));
+    for(const legacy of JSON.parse(process.env.LEGACY_INSTALLERS)) {
+      for(const mode of [[],['--check'],['--uninstall']]) {
+        const result=spawnSync(process.execPath,[join(legacy,'plugin/install.mjs'),'--app',f.app,'--home',f.home,...mode],{encoding:'utf8'});
+        assert.equal(result.status,1,result.stdout+result.stderr);
+        assert.match(result.stderr,/path.*string|type string|previous\.find|适配备份|备份清单/i);
+        files.forEach((file,index)=>assert.deepEqual(fs.readFileSync(file),before[index]));
+        assert.equal(fs.existsSync(join(f.paths.root,'pending.json')),false);
+      }
+    }
+  }finally{f.close();}
 });
 for (const phase of ['prepared', ...Array.from({length: 7}, (_, index) => 'committed-' + index)]) test(`fault at ${phase} restores all host, plugin, config and credentials`, () => {
   const f = fixture(); try {
@@ -187,7 +249,8 @@ test('corrupt host backup refuses uninstall before changing current files', () =
     const adapter = join(f.app, '.session-editor-adapter');
     const manifest = JSON.parse(fs.readFileSync(join(adapter, 'manifest.json')));
     const current = fs.readFileSync(join(f.app, hostFiles[0]));
-    fs.appendFileSync(join(adapter, manifest[0].original), 'corrupt backup');
+    assert.equal(manifest.schema,2);
+    fs.appendFileSync(join(adapter, manifest.entries[0].original), 'corrupt backup');
     assert.throws(() => preflight(f.app, f.home, true), /备份校验失败/);
     assert.deepEqual(fs.readFileSync(join(f.app, hostFiles[0])), current);
     assert.equal(fs.existsSync(join(f.paths.root, 'pending.json')), false);

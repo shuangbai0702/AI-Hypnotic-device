@@ -4,11 +4,12 @@ const allowed = [
   /^(?:\.gitignore|README\.md|package\.json)$/,
   /^docs\/(?:GITHUB-PUBLISH-PLAN|VALIDATION|RELIABILITY-PLAN|RELIABILITY-VALIDATION)\.md$/,
   /^scripts\/check-release\.mjs$/,
-  /^packaging\/windows\/(?:Build\.ps1|Installer\.ps1|Discovery\.ps1|Desktop\.ps1|Launcher\.cs|README\.md)$/,
+  /^packaging\/windows\/(?:Build\.ps1|Installer\.ps1|Discovery\.ps1|Desktop\.ps1|Update\.ps1|Launcher\.cs|README\.md)$/,
+  /^packaging\/windows\/assets\/installer-art\.png$/,
   /^plugins\/dsh-session-editor\/(?:package\.json|README\.md|AGENT\.md|install\.mjs|host-adapter\.mjs)$/,
   /^plugins\/dsh-session-editor\/lib\/[a-z-]+\.(?:js|mjs)$/,
   /^tests\/(?:memory-workbench|workbench-client|memory-assistant|context-coverage|session-editor-regression|assistant-edit-wire|memory-ergonomics-client|native-chat-projection|storage-integrity|runtime-diagnostics|installer-transaction|desktop-installation|native-session-e2e)\.mjs$/,
-  /^tests\/windows-(?:installation-e2e|desktop-e2e|discovery|health-rollback)\.ps1$/,
+  /^tests\/windows-(?:installation-e2e|desktop-e2e|discovery|update|health-rollback)\.ps1$/,
 ];
 const patterns = [
   ['personal Windows path', /[A-Z]:[\\/](?:Users|MYCODE)[\\/]/i],
@@ -30,6 +31,11 @@ if (!files.length) throw new Error('No tracked release files to inspect');
 const failures = [];
 for (const file of files) {
   if (!allowed.some(pattern => pattern.test(file))) failures.push(`${file}: outside release allowlist`);
+  if (file === 'packaging/windows/assets/installer-art.png') {
+    const asset = spawnSync('git', ['show', ':' + file], { maxBuffer: 8 * 1024 * 1024 });
+    if (asset.status !== 0 || !asset.stdout?.subarray(0, 8).equals(Buffer.from([137,80,78,71,13,10,26,10]))) failures.push(`${file}: invalid PNG asset`);
+    continue;
+  }
   const source = git('show', ':' + file);
   for (const [label, pattern] of patterns) {
     if (pattern.test(source)) failures.push(`${file}: ${label}`);

@@ -21,7 +21,8 @@ function replaceOnce(text, before, after) {
 export function planAdapter(app, restore = false, { readFile = readFileSync, exists = existsSync, resolveFile = resolveHostFile } = {}) {
   const backup = join(app, ".session-editor-adapter");
   const manifestPath = join(backup, "manifest.json");
-  const previous = exists(manifestPath) ? JSON.parse(readFile(manifestPath, "utf8")) : [];
+  const record = exists(manifestPath) ? JSON.parse(readFile(manifestPath, "utf8")) : [];
+  const previous = Array.isArray(record) ? record : record?.schema === 2 ? record.entries : null;
   if (!Array.isArray(previous) || previous.some(entry => !/^[a-f0-9]{64}$/.test(entry.original) || !/^[a-f0-9]{64}$/.test(entry.patched))) throw new Error('宿主适配备份清单无效');
   if (restore && previous.length) {
     const changes = previous.map((m) => {

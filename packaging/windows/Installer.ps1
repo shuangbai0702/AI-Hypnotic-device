@@ -1,6 +1,8 @@
 ﻿param(
     [switch]$Apply,
     [switch]$Discover,
+    [switch]$UpdateOnly,
+    [switch]$SkipUpdate,
     [switch]$NoDownload,
     [string]$NodePath,
     [string]$AppPath,
@@ -15,6 +17,9 @@ $ErrorActionPreference = 'Stop'
 $PackageRoot = Split-Path -Parent $PSScriptRoot
 . (Join-Path $PSScriptRoot 'Discovery.ps1')
 . (Join-Path $PSScriptRoot 'Desktop.ps1')
+. (Join-Path $PSScriptRoot 'Update.ps1')
+$PackageVersion=(Get-Content -LiteralPath (Join-Path $PackageRoot 'plugin/package.json') -Raw | ConvertFrom-Json).version
+if($UpdateOnly){Get-InstallerUpdate $PackageVersion | ConvertTo-Json -Depth 5 | Set-Content -LiteralPath $ResultFile -Encoding UTF8;exit 0}
 if ($Discover) {
     try { $found=@(Find-DshCandidates -PreferredPort $Port); @{ok=$true;candidates=$found} | ConvertTo-Json -Depth 5 | Set-Content -LiteralPath $ResultFile -Encoding UTF8; exit 0 }
     catch { @{ok=$false;error=$_.Exception.Message} | ConvertTo-Json | Set-Content -LiteralPath $ResultFile -Encoding UTF8; exit 1 }
@@ -31,6 +36,13 @@ function Get-ProcessApp($Process) {
 }
 function Test-DshApp([string]$Directory) {
     try { return (Test-Path -LiteralPath (Join-Path $Directory 'lib/bin.js')) -and ((Get-Content -LiteralPath (Join-Path $Directory 'package.json') -Raw | ConvertFrom-Json).name -eq '@deepseek-ai/dsh') } catch { return $false }
+}
+function Invoke-InstallPreflight([string]$Node,[string[]]$CheckArguments) {
+    $previousAction=$ErrorActionPreference
+    $previousEncoding=[Console]::OutputEncoding
+    try{[Console]::OutputEncoding=New-Object Text.UTF8Encoding($false);$ErrorActionPreference='Continue';$global:LASTEXITCODE=$null;$text=(& $Node @CheckArguments 2>&1 | Out-String);$code=$global:LASTEXITCODE}
+    finally{$ErrorActionPreference=$previousAction;[Console]::OutputEncoding=$previousEncoding}
+    if($code -ne 0){throw ('安装/卸载预检失败；未停止服务或修改目标。'+[Environment]::NewLine+$text.Trim())}
 }
 
 function Invoke-Install {
@@ -74,8 +86,7 @@ function Invoke-Install {
     }
     $checkArgs=@($installer,'--app',$AppPath,'--home',$DshHome,'--check')
     if ($Uninstall) { $checkArgs+='--uninstall' }
-    & $node @checkArgs
-    if ($LASTEXITCODE -ne 0) { throw '安装/卸载预检失败；未停止服务或修改目标。' }
+    Invoke-InstallPreflight $node $checkArgs
     $service=$null; $serviceIdentity=$null; $stopped=$false; $submitted=$false; $rolledBack=$false
     $previousHome=$env:DSH_HOME
     try {
@@ -202,13 +213,50 @@ foreach($item in @(@($appBox,176),@($homeBox,226))){
 $installButton=New-Object Windows.Forms.Button;$installButton.Text='安装并启动';$installButton.SetBounds(125,398,220,40);$installButton.Enabled=$false;$form.Controls.Add($installButton)
 $removeButton=New-Object Windows.Forms.Button;$removeButton.Text='卸载并恢复';$removeButton.SetBounds(370,398,220,40);$removeButton.Enabled=$false;$form.Controls.Add($removeButton)
 $status=New-Object Windows.Forms.Label;$status.SetBounds(22,457,790,70);$form.Controls.Add($status)
+$form.Text='AI Hypnotic device · v'+$PackageVersion
+$form.ClientSize=New-Object Drawing.Size(1160,720)
+$form.BackColor=[Drawing.Color]::FromArgb(247,249,255)
+$form.AutoScaleMode=[Windows.Forms.AutoScaleMode]::Dpi
+$form.AutoScroll=$true;$form.AutoScrollMinSize=New-Object Drawing.Size(1160,720)
+foreach($control in $form.Controls){$control.Left+=300;$control.Top+=90}
+foreach($button in @($scanButton,$installButton,$removeButton)+$browseButtons){
+    $button.FlatStyle='Flat';$button.FlatAppearance.BorderColor=[Drawing.Color]::FromArgb(191,207,236)
+    $button.BackColor=[Drawing.Color]::FromArgb(232,240,253);$button.ForeColor=[Drawing.Color]::FromArgb(63,86,135)
+}
+$installButton.Text='安装 / 更新并启动';$installButton.BackColor=[Drawing.Color]::FromArgb(201,219,248)
+$heading=Add-Label 'AI Hypnotic device' 322 20 790
+$heading.Font=New-Object Drawing.Font('Microsoft YaHei UI',19,[Drawing.FontStyle]::Bold)
+$heading.Height=40;$heading.ForeColor=[Drawing.Color]::FromArgb(65,94,156)
+$updateHint=Add-Label ('安装包 v'+$PackageVersion+' · 准备检查新版…') 322 64 790
+$updateHint.ForeColor=[Drawing.Color]::FromArgb(105,125,162)
+$updateButton=New-Object Windows.Forms.Button;$updateButton.Text='检查安装器更新';$updateButton.SetBounds(322,650,190,36);$updateButton.FlatStyle='Flat';$form.Controls.Add($updateButton)
+$updateButton.BackColor=[Drawing.Color]::FromArgb(232,240,253);$updateButton.ForeColor=[Drawing.Color]::FromArgb(63,86,135);$updateButton.FlatAppearance.BorderColor=[Drawing.Color]::FromArgb(191,207,236)
+Add-Type -ReferencedAssemblies System.Windows.Forms,System.Drawing -TypeDefinition @'
+using System; using System.Drawing; using System.Drawing.Drawing2D; using System.Windows.Forms;
+public class InstallerArtwork : Control {
+ public Image Picture {get;set;}
+ public InstallerArtwork(){DoubleBuffered=true;}
+ protected override void OnPaint(PaintEventArgs e){
+  base.OnPaint(e);if(Picture==null)return;
+  var g=e.Graphics;g.InterpolationMode=InterpolationMode.HighQualityBicubic;
+  double scale=Math.Max(Width/(double)Picture.Width,Height/(double)Picture.Height);
+  float w=(float)(Width/scale),h=(float)(Height/scale);
+  g.DrawImage(Picture,ClientRectangle,new RectangleF((Picture.Width-w)/2,(Picture.Height-h)/2,w,h),GraphicsUnit.Pixel);
+ }
+ protected override void Dispose(bool disposing){if(disposing&&Picture!=null){Picture.Dispose();Picture=null;}base.Dispose(disposing);}
+}
+'@
+$art=New-Object InstallerArtwork;$art.SetBounds(0,0,300,720);
+$artPath=Join-Path $PSScriptRoot 'assets/installer-art.png'
+try{if(Test-Path -LiteralPath $artPath){$art.Picture=[Drawing.Image]::FromFile($artPath)}}catch{Write-Warning '安装器插图无法加载，将继续显示操作界面。'}
+$form.Controls.Add($art)
 $timer=New-Object Windows.Forms.Timer;$timer.Interval=250
 $script:worker=$null;$script:workerResult=$null;$script:workerKind='';$script:detected=@()
 function Update-Controls {
     $busy=$null -ne $script:worker
     $desktopTarget=Test-DesktopApp $appBox.Text
     $canInstall=-not $busy -and ($advanced.Checked -or $targets.SelectedIndex -ge 0) -and $appBox.Text -and $homeBox.Text
-    $installButton.Enabled=[bool]$canInstall;$removeButton.Enabled=[bool]$canInstall;$scanButton.Enabled=-not $busy;$targets.Enabled=-not $busy;$advanced.Enabled=-not $busy
+    $installButton.Enabled=[bool]$canInstall;$removeButton.Enabled=[bool]$canInstall;$scanButton.Enabled=-not $busy;$targets.Enabled=-not $busy;$advanced.Enabled=-not $busy;$updateButton.Enabled=-not $busy
     $appBox.ReadOnly=$busy -or -not $advanced.Checked;$homeBox.ReadOnly=$busy -or -not $advanced.Checked;$portBox.ReadOnly=$busy -or -not $advanced.Checked;$portBox.Enabled=-not $desktopTarget
     foreach($button in $browseButtons){$button.Enabled=$advanced.Checked -and -not $busy}
 }
@@ -217,10 +265,12 @@ function Start-Background([string]$Kind,[string[]]$Extra) {
     $script:workerResult=Join-Path ([IO.Path]::GetTempPath()) ('dsh-installer-'+[guid]::NewGuid().ToString()+'.json')
     $arguments=@('-NoLogo','-NoProfile','-STA','-ExecutionPolicy','Bypass','-File',('"'+$PSCommandPath+'"'),'-ResultFile',('"'+$script:workerResult+'"'))+$Extra
     $shell=Join-Path ([Environment]::GetFolderPath('System')) 'WindowsPowerShell/v1.0/powershell.exe'
-    $script:worker=Start-Process -FilePath $shell -ArgumentList $arguments -WindowStyle Hidden -PassThru
+    try{$script:worker=Start-Process -FilePath $shell -ArgumentList $arguments -WindowStyle Hidden -PassThru}
+    catch{$status.Text='无法启动后台操作：'+$_.Exception.Message;Update-Controls;return}
     $script:workerKind=$Kind;Update-Controls;$status.Text=if($Kind -eq 'discovery'){'正在从运行进程、PATH、npm/npx 缓存与版本管理器自动查找…'}else{'正在检测运行时、预检、备份、安装及验证，请稍候…'};$timer.Start()
 }
 function Start-Discovery {Start-Background 'discovery' @('-Discover','-Port',"$Port")}
+function Start-Update {Start-Background 'update' @('-UpdateOnly');$status.Text='正在检查官方发布，有新版时自动下载并校验；不会改动 DSH。'}
 function Start-InstallWorker([bool]$Remove) {
     $parsedPort=0
     if(-not [int]::TryParse($portBox.Text,[ref]$parsedPort) -or $parsedPort -lt 1024 -or $parsedPort -gt 65535){$status.Text='端口无效。';return}
@@ -237,18 +287,27 @@ $targets.Add_SelectedIndexChanged({
 $advanced.Add_CheckedChanged({Update-Controls})
 $appBox.Add_TextChanged({Update-Controls});$homeBox.Add_TextChanged({Update-Controls})
 $scanButton.Add_Click({Start-Discovery});$installButton.Add_Click({Start-InstallWorker $false});$removeButton.Add_Click({Start-InstallWorker $true})
+$updateButton.Add_Click({Start-Update})
 $timer.Add_Tick({
     if($script:worker -and $script:worker.HasExited){
         $timer.Stop();$result=$null
         try{if(Test-Path -LiteralPath $script:workerResult){$result=Get-Content -LiteralPath $script:workerResult -Raw | ConvertFrom-Json;Remove-Item -LiteralPath $script:workerResult}}
         catch{$status.Text='无法读取检测结果，请重试。'}
         $kind=$script:workerKind;$script:worker.Dispose();$script:worker=$null
-        if($kind -eq 'discovery'){
+        if($kind -eq 'update'){
+            $updateHint.Text=if($result){$result.message}else{'更新检查未完成，仍可使用当前安装包。'}
+            if($result -and $result.ok -and $result.updated){
+                try{Start-Process -FilePath $result.executable -ArgumentList '-SkipUpdate' -WindowStyle Normal | Out-Null;$form.Close();return}
+                catch{$updateHint.Text='新版已下载，但启动失败。当前安装包仍可使用。'}
+            }
+            if(-not $script:detected.Count){Start-Discovery}
+        }elseif($kind -eq 'discovery'){
             $targets.Items.Clear();$script:detected=@()
             if($result -and $result.ok){
                 $script:detected=@($result.candidates)
                 foreach($candidate in $script:detected){[void]$targets.Items.Add($candidate.label)}
-                if($script:detected.Count -eq 1){$targets.SelectedIndex=0;$status.Text='自动检测完成。'}
+                $preferredIndex=Get-PreferredDshIndex $script:detected $Port
+                if($preferredIndex -ge 0){$targets.SelectedIndex=$preferredIndex;$status.Text=if($script:detected.Count -gt 1){'已优先选择正在运行、端口为 '+$Port+' 的 DSH；请核对程序和数据目录。'}else{'自动检测完成。'}}
                 elseif($script:detected.Count -gt 1){$hint.Text='发现多个 DSH，请从上方列表选择目标。';$status.Text='不会自动修改其他 DSH。'}
                 else{$hint.Text='未找到 DSH，可重新检测或展开高级选项。';$status.Text='已自动重试。请确认 DSH 已安装或正在运行。'}
             }else{$status.Text=if($result){$result.error}else{'自动检测未完成，请重试。'}}
@@ -257,6 +316,21 @@ $timer.Add_Tick({
         };Update-Controls
     }
 })
-$form.Add_Shown({Start-Discovery})
-$form.Add_FormClosing({if($script:worker -and -not $script:worker.HasExited){$_.Cancel=$true;$status.Text='正在检测或安装，请等待当前操作结束。'}})
+$form.Add_Shown({
+    $area=[Windows.Forms.Screen]::FromControl($form).WorkingArea
+    if($form.Width -gt $area.Width-16){$form.Width=[Math]::Max(400,$area.Width-16)}
+    if($form.Height -gt $area.Height-16){$form.Height=[Math]::Max(350,$area.Height-16)}
+    if($SkipUpdate -or $NoDownload){$updateHint.Text='本次跳过联网更新检查。';Start-Discovery}else{Start-Update}
+})
+$form.Add_FormClosing({
+    if($script:worker -and -not $script:worker.HasExited){
+        if($script:workerKind -eq 'install'){$_.Cancel=$true;$status.Text='正在提交或验证安装，请等待当前操作结束，避免留下中断事务。'}
+        else{
+            $timer.Stop()
+            try{$script:worker.Kill();$script:worker.WaitForExit(2000) | Out-Null}catch{}
+            $script:worker.Dispose();$script:worker=$null
+            if($script:workerResult -and (Test-Path -LiteralPath $script:workerResult)){Remove-Item -LiteralPath $script:workerResult -Force -ErrorAction SilentlyContinue}
+        }
+    }
+})
 [void]$form.ShowDialog();$timer.Dispose();$form.Dispose()

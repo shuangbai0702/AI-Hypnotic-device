@@ -1,7 +1,7 @@
 {
   "name": "@shuangbai/dsh-session-editor",
-  "description": "Session context/history/summary editor for shuangbai-dsh",
-  "version": "0.4.1",
+  "description": "Session context/history/summary editor for DeepSeek Harness",
+  "version": "0.4.2",
   "bin": { "dsh-session-editor-install": "./install.mjs" },
   "files": ["lib/*.js", "lib/*.mjs", "install.mjs", "host-adapter.mjs", "README.md", "AGENT.md"],
   "type": "module",

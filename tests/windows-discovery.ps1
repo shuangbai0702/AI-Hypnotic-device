@@ -17,6 +17,12 @@ function Get-Command {param($Name,[switch]$All,$ErrorAction);return @()}
 function Get-CommonNodeDirectories {return $script:managerRoot}
 function Assert-True($Value,$Message){if(-not $Value){throw $Message}}
 try{
+    $choices=@(@{source='正在运行';profile='web';port=3099},@{source='正在运行';profile='web';port=3080},@{source='桌面安装目录';profile='desktop';port=3080})
+    Assert-True ((Get-PreferredDshIndex $choices) -eq 1) 'Default release must prefer actual running web DSH on 3080 over developer and desktop targets'
+    Assert-True ((Get-PreferredDshIndex $choices 3099) -eq 0) 'Explicit custom port remains supported'
+    Assert-True ((Get-PreferredDshIndex @($choices[0],$choices[2])) -eq -1) 'No preferred web listener means manual selection'
+    Assert-True ((Get-PreferredDshIndex @($choices[1],$choices[1])) -eq -1) 'Ambiguous preferred listener means manual selection'
+    Assert-True ((Get-PreferredDshIndex @()) -eq -1) 'Empty detection cannot select a target'
     foreach($directory in @("$app/lib","$dataHome/profiles/web","$app/.session-editor-adapter",$script:managerRoot)){New-Item -ItemType Directory -Force $directory | Out-Null}
     [IO.File]::WriteAllText((Join-Path $app 'package.json'),'{"name":"@deepseek-ai/dsh","version":"0.2.1-rc.2"}')
     [IO.File]::WriteAllText((Join-Path $app 'lib/bin.js'),'// synthetic discovery only')

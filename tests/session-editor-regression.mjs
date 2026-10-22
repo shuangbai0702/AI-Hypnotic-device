@@ -192,11 +192,13 @@ test("install, reinstall, uninstall preserve host bytes; unknown builds are reje
   // were managed there. Upgrade must add the client adapter and retain originals.
   const adapterManifest = join(app, ".session-editor-adapter/manifest.json");
   const installed = JSON.parse(readFileSync(adapterManifest, "utf8"));
-  writeFileSync(adapterManifest, JSON.stringify(installed.slice(0, 2)));
+  assert.equal(installed.schema, 2);
+  writeFileSync(adapterManifest, JSON.stringify(installed.entries.slice(0, 2)));
   writeFileSync(join(app, files[2]), originals[2]);
   for (let i = 0; i < 2; i++) { const r = run(); assert.equal(r.status, 0, r.stderr); }
   assert.equal(readFileSync(installedPrompt, 'utf8'), 'user-customized assistant prompt');
-  assert.equal(JSON.parse(readFileSync(adapterManifest, "utf8")).length, 3);
+  const upgraded = JSON.parse(readFileSync(adapterManifest, "utf8"));
+  assert.equal(upgraded.schema, 2); assert.equal(upgraded.entries.length, 3);
   assert.match(readFileSync(join(home, "profiles/web/cordis.patch.yml"), "utf8"), /session-editor/);
   const r = run("--uninstall"); assert.equal(r.status, 0, r.stderr);
   files.forEach((f, i) => assert.deepEqual(readFileSync(join(app, f)), originals[i]));

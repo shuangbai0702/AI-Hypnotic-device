@@ -3,6 +3,8 @@ import { join, resolve, dirname, basename, relative, isAbsolute } from 'node:pat
 import { createHash, randomUUID } from 'node:crypto';
 import { createRequire } from 'node:module';
 import { isDeepStrictEqual } from 'node:util';
+import { fileURLToPath } from 'node:url';
+import { checkInstallVersion, installationRecord, packageVersion, pluginName } from './install-version.js';
 import { planAdapter, resolveHostFile } from '../host-adapter.mjs';
 import { desktopArchive, desktopYaml } from './desktop-archive.js';
 
@@ -108,8 +110,11 @@ function uninstallConfig(paths, current, manifest) {
   const remaining = now.filter((_value, index) => index !== matches[0]);
   return { text: yaml.dump(remaining, { noRefs: true, lineWidth: 120 }), existed: existed || remaining.length > 0 };
 }
-export function preflight(app, home, uninstall = false) {
+export function preflight(app, home, uninstall = false, source = fileURLToPath(new URL('../', import.meta.url))) {
   const paths = installPaths(app, home);
+  // Check before touching host files, and repeat under the transaction locks.
+  if (uninstall) installationRecord(paths);
+  else checkInstallVersion(paths, source);
   if (paths.desktop) paths.desktop = desktopArchive(paths.app);
   const ownerPath = join(paths.app, '.session-editor-adapter/owner.json');
   if (exists(ownerPath)) {
@@ -120,13 +125,12 @@ export function preflight(app, home, uninstall = false) {
   checkAdapter(paths, uninstall);
   const before = exists(paths.config) ? read(paths.config) : '';
   if (uninstall) {
-    const manifest = JSON.parse(read(paths.manifest));
-    if (resolve(manifest.app) !== paths.app) throw new Error('安装记录属于其他 DSH');
+    const manifest = installationRecord(paths);
+    if (!manifest) throw new Error('没有安装记录；拒绝卸载');
     if (manifest.hadPlugin && !exists(join(paths.state, 'previous-plugin'))) throw new Error('安装前插件备份缺失；拒绝卸载');
     uninstallConfig(paths, before, manifest);
   } else {
     prepareConfig(paths.app, before);
-    if (exists(paths.manifest) && resolve(JSON.parse(read(paths.manifest)).app) !== paths.app) throw new Error('此数据目录已绑定其他 DSH');
   }
   return paths;
 }
@@ -229,14 +233,14 @@ export function recoverInstallation(app, home, complete = false) {
 export function installTransaction(app, home, source, { uninstall = false, deferHealth = false, checkpoint = () => {} } = {}) {
   const targetRelative = relative(installPaths(app, home).target, resolve(source));
   if (!targetRelative || (!targetRelative.startsWith('..') && !isAbsolute(targetRelative))) throw new Error('不能从已安装的插件目录覆盖自身；请使用独立安装包');
-  let paths = preflight(app, home, uninstall);
+  let paths = preflight(app, home, uninstall, source);
   const release = acquire(paths);
   const id = randomUUID(), root = join(paths.root, id), file = join(root, 'journal.json');
   const journal = { id, app: paths.app, home: paths.home, operation: uninstall ? 'uninstall' : 'install', phase: 'preparing', entries: [] };
   try {
     // Refresh the captured archive and owner/config checks after acquiring both
     // locks; another installer may have completed while this one was probing.
-    paths = preflight(app, home, uninstall);
+    paths = preflight(app, home, uninstall, source);
     if (exists(join(paths.root, 'pending.json'))) throw new Error('另一个安装器留下待确认事务；请先恢复');
     // Prepare a complete adapter in an isolated miniature host before touching
     // the real host. Only the three explicitly managed modules are copied.
@@ -248,6 +252,13 @@ export function installTransaction(app, home, source, { uninstall = false, defer
     if (exists(join(paths.app, 'package.json'))) copy(join(paths.app, 'package.json'), join(hostStage, 'package.json'));
     if (exists(join(paths.app, '.session-editor-adapter'))) copy(join(paths.app, '.session-editor-adapter'), join(hostStage, '.session-editor-adapter'));
     planAdapter(hostStage, uninstall)();
+    // The first public installer never read install.json. Its adapter only
+    // accepts the legacy array, so version the host record too. Explicit
+    // uninstall restores that array together with the original host bytes.
+    const hostManifest = join(hostStage, '.session-editor-adapter/manifest.json');
+    const hostRecord = JSON.parse(read(hostManifest));
+    const entries = Array.isArray(hostRecord) ? hostRecord : hostRecord.entries;
+    fs.writeFileSync(hostManifest, JSON.stringify(uninstall ? entries : { schema: 2, entries }, null, 2));
     fs.mkdirSync(join(hostStage, '.session-editor-adapter'), { recursive: true });
     fs.writeFileSync(join(hostStage, '.session-editor-adapter/owner.json'), JSON.stringify({ home: paths.home, active: !uninstall }));
     const operations = [];
@@ -296,13 +307,15 @@ export function installTransaction(app, home, source, { uninstall = false, defer
         if (entry.isFile() && /\.(?:js|mjs)$/.test(entry.name)) copy(join(source, 'lib', entry.name), join(pluginStage, 'lib', entry.name));
       }
       fs.writeFileSync(join(pluginStage, 'host.json'), JSON.stringify({ app: paths.desktop?.cli ?? paths.app, home: paths.home }, null, 2));
+      checkInstallVersion(paths, pluginStage);
       operations.push({ destination: paths.target, source: pluginStage });
-      if (!exists(paths.manifest)) {
-        const manifestStage = join(root, 'install.json');
-        fs.writeFileSync(manifestStage, JSON.stringify({ app: paths.app, configBefore: before, configExisted: exists(paths.config), configAfter: read(configStage), hadPlugin: exists(paths.target) }, null, 2));
-        operations.push({ destination: paths.manifest, source: manifestStage });
-        if (exists(paths.target)) operations.push({ destination: join(paths.state, 'previous-plugin'), source: paths.target });
-      }
+      const baseline = installationRecord(paths) ?? { configBefore: before, configExisted: exists(paths.config), configAfter: read(configStage), hadPlugin: exists(paths.target) };
+      const manifestStage = join(root, 'install.json');
+      // Structured app identity deliberately fails closed in legacy installers,
+      // whose preflight only understands the unversioned string format.
+      fs.writeFileSync(manifestStage, JSON.stringify({ ...baseline, schema: 2, app: { path: paths.app }, plugin: { name: pluginName, version: packageVersion(pluginStage) } }, null, 2));
+      operations.push({ destination: paths.manifest, source: manifestStage });
+      if (!exists(paths.manifest) && exists(paths.target)) operations.push({ destination: join(paths.state, 'previous-plugin'), source: paths.target });
     }
     operations.push({ destination: paths.config, source: restoreConfig ? configStage : null });
     for (const [index, operation] of operations.entries()) {

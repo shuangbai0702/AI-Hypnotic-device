@@ -24,6 +24,10 @@
 !/packaging/windows/Installer.ps1
 !/packaging/windows/Discovery.ps1
 !/packaging/windows/Desktop.ps1
+!/packaging/windows/Update.ps1
+!/packaging/windows/assets/
+/packaging/windows/assets/*
+!/packaging/windows/assets/installer-art.png
 !/packaging/windows/Launcher.cs
 !/packaging/windows/README.md
 !/scripts/
@@ -45,6 +49,7 @@
 !/tests/native-session-e2e.mjs
 !/tests/windows-installation-e2e.ps1
 !/tests/windows-discovery.ps1
+!/tests/windows-update.ps1
 !/tests/desktop-installation.mjs
 !/tests/windows-desktop-e2e.ps1
 !/tests/windows-health-rollback.ps1

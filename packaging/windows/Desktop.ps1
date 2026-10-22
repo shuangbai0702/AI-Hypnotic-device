@@ -28,8 +28,7 @@ function Invoke-DesktopInstall {
     if(Test-Path -LiteralPath $pending){& $node $installer --app $AppPath --home $DshHome --recover;if($LASTEXITCODE -ne 0){throw '桌面中断事务恢复失败'}}
     $arguments=@($installer,'--app',$AppPath,'--home',$DshHome)
     if($Uninstall){$arguments+='--uninstall'}
-    & $node @arguments --check
-    if($LASTEXITCODE -ne 0){throw '桌面安装预检失败；未修改文件。'}
+    Invoke-InstallPreflight $node ($arguments+@('--check'))
     $submitted=$false
     try {
         & $node @arguments --defer-health
